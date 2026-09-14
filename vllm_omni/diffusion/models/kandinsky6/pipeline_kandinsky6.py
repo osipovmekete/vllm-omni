@@ -1158,7 +1158,7 @@ class Kandinsky6TI2VAPipeline(
         if generator is None and sampling.seed is not None:
             generator = torch.Generator(device=self.device).manual_seed(sampling.seed)
         seed = (
-            int(torch.randint(0, 2**31, (1,), generator=generator, device=torch.device("cpu")).item())
+            int(torch.randint(0, 2**31, (1,), generator=generator, device=generator.device).item())
             if generator is not None
             else int(torch.randint(0, 2**31, (1,)).item())
         )
