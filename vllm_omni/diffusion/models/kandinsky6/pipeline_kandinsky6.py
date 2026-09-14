@@ -871,7 +871,17 @@ class Kandinsky6TI2VAPipeline(
         model_config = dict(od_config.model_config or {})
 
         transformer_dir = os.path.join(model_root, "transformer")
-        transformer = Kandinsky6Transformer3DModel.from_pretrained(transformer_dir, torch_dtype=dtype).to(self.device)
+        # low_cpu_mem_usage=False: diffusers' default meta-device fast-init path
+        # (accelerate.init_empty_weights) monkey-patches register_parameter to
+        # accelerate's register_empty_parameter, which only knows the plain
+        # torch.nn.Parameter signature. vLLM's RowvLLMParameter/ColumnvLLMParameter
+        # (used throughout this model's ColumnParallelLinear/RowParallelLinear
+        # layers) require an input_dim kwarg accelerate can't supply, so the
+        # meta-device path must be disabled here (same fix as
+        # dynin_omni_token2audio.py's AutoModel.from_pretrained call).
+        transformer = Kandinsky6Transformer3DModel.from_pretrained(
+            transformer_dir, torch_dtype=dtype, low_cpu_mem_usage=False
+        ).to(self.device)
 
         vae_dir = os.path.join(model_root, "vae")
         vae = AutoencoderKLHunyuanVideo.from_pretrained(vae_dir, torch_dtype=torch.float16).to(self.device).eval()
