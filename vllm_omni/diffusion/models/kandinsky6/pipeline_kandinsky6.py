@@ -906,17 +906,19 @@ class Kandinsky6TI2VAPipeline(
 
         return transformer, vae, text_encoder, audio_vae, scheduler, tokenizer, text_encoder_2, tokenizer_2
 
-    def load_weights(self, weights: Iterable[tuple[str, Tensor]]) -> set[str]:
-        weights = list(weights)
-        loaded: set[str] = set()
-        for name, module in (("transformer", self.transformer), ("vae", self.vae), ("audio_vae", self.audio_vae)):
-            if module is None:
-                continue
-            prefixed = ((n.removeprefix(f"{name}."), t) for n, t in weights if n.startswith(f"{name}."))
-            module_load_weights = getattr(module, "load_weights", None)
-            if callable(module_load_weights):
-                loaded |= {f"{name}.{n}" for n in module_load_weights(prefixed)}
-        return loaded
+    def load_weights(self, weights: Iterable[tuple[str, Tensor]]) -> set[str] | None:
+        """No-op for the framework loader: every component (transformer, vae,
+        audio_vae, text_encoder, text_encoder_2) is self-loaded via
+        ``_load_components()``'s per-module ``from_pretrained()`` calls in
+        ``__init__``. We expose no ``weights_sources``, so the framework
+        loader's generic top-level scan can't see any of that; returning
+        ``None`` (same fix as Pi0Pipeline.load_weights, which self-loads for
+        the same reason) skips its strict unloaded-weights check instead of
+        misreporting every parameter as missing.
+        """
+        for _ in weights:
+            pass
+        return None
 
     # ------------------------------------------------------------------
     # Prompt encoding — same Qwen2.5-VL + CLIP dual-encoder logic as the
