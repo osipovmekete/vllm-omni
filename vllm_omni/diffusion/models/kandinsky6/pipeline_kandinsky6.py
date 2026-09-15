@@ -15,6 +15,7 @@ imports, exactly like vLLM-Omni's other native pipelines (e.g.
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Iterable
 from contextlib import nullcontext
@@ -34,6 +35,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.interface import SupportAudioOutput, SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
@@ -890,18 +892,39 @@ class Kandinsky6TI2VAPipeline(
         text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(text_encoder_dir, torch_dtype=dtype).to(
             self.device
         )
-        tokenizer = QwenAutoProcessor.from_pretrained(text_encoder_dir)
+        # Tokenizer/processor files live in the sibling `tokenizer/` directory
+        # (standard Diffusers multi-component layout), not inside
+        # `text_encoder/` itself — that dir only has the model weights/config.
+        tokenizer = QwenAutoProcessor.from_pretrained(os.path.join(model_root, "tokenizer"))
+        # encode_prompt() crops embeddings at a fixed offset (_QWEN_CROP_START)
+        # assuming the fixed system-prompt prefix leads and any padding trails
+        # — don't trust the checkpoint's own tokenizer_config.json for this;
+        # pin it explicitly like every sibling pipeline that does fixed-offset
+        # crops does (sana_video, sana_wm, boogu_image).
+        tokenizer.tokenizer.padding_side = "right"
 
         clip_dir = os.path.join(model_root, "text_encoder_2")
         text_encoder_2 = CLIPTextModel.from_pretrained(clip_dir, torch_dtype=dtype).to(self.device)
-        tokenizer_2 = CLIPTokenizer.from_pretrained(clip_dir)
+        tokenizer_2 = CLIPTokenizer.from_pretrained(os.path.join(model_root, "tokenizer_2"))
 
         audio_vae = None
         audio_vae_dir = os.path.join(model_root, "audio_vae")
         if bool(model_config.get("sample_audio", True)) and os.path.isdir(audio_vae_dir):
             audio_vae = Kandinsky6AudioVAE.from_pretrained(audio_vae_dir, torch_dtype=dtype).to(self.device).eval()
 
-        scheduler_scale = float(model_config.get("scheduler_scale", 3.0))
+        # model_config never actually carries a "scheduler_scale" key in
+        # practice (nothing populates it from the checkpoint), so this always
+        # fell back to a hardcoded 3.0 — wrong for every known K6 checkpoint,
+        # which persist their real shift as scheduler/scheduler_config.json's
+        # "shift" key (same convention lingbot_world's pipeline already reads
+        # at vllm_omni/diffusion/models/lingbot_world/pipeline.py:504).
+        checkpoint_scheduler_scale = 5.0  # matches every known K6 generation config and kandinsky-5's own CLI default
+        scheduler_config_path = os.path.join(model_root, "scheduler", "scheduler_config.json")
+        if os.path.isfile(scheduler_config_path):
+            checkpoint_scheduler_scale = float(
+                _load_json(model_root, "scheduler/scheduler_config.json").get("shift", checkpoint_scheduler_scale)
+            )
+        scheduler_scale = float(model_config.get("scheduler_scale", checkpoint_scheduler_scale))
         scheduler = KandinskyFlowMatchScheduler(scheduler_scale=scheduler_scale, device=self.device)
 
         return transformer, vae, text_encoder, audio_vae, scheduler, tokenizer, text_encoder_2, tokenizer_2
@@ -1104,7 +1127,7 @@ class Kandinsky6TI2VAPipeline(
             else None,
             device=device,
         )
-        with self.progress_bar(total=num_inference_steps):
+        with self.progress_bar(total=num_inference_steps) as progress_bar:
             return denoise_loop(
                 bundle=bundle,
                 dit=self.transformer,
@@ -1125,6 +1148,7 @@ class Kandinsky6TI2VAPipeline(
                 null_attention_mask=negative_mask,
                 visual_token_type_ids=visual_token_type_ids,
                 scale_factor=self.scale_factor,
+                progress_callback=progress_bar.update,
             )
 
     # ------------------------------------------------------------------
@@ -1143,6 +1167,16 @@ class Kandinsky6TI2VAPipeline(
         image = None if isinstance(prompt_obj, str) else prompt_obj.get("image")
         if not prompt:
             raise ValueError("Prompt is required for Kandinsky 6 generation.")
+
+        # The transformer's text-projection cache is keyed by tensor.data_ptr(),
+        # not a value/content key, and is documented as scoped "within a
+        # generation" — but nothing ever called clear_text_proj_cache() before
+        # this fix, so it persisted for the whole process lifetime. The pooled
+        # CLIP embedding's shape never varies, so a freed tensor's CUDA address
+        # getting reused by the allocator (e.g. after the startup dummy-run
+        # warmup, or the previous request) silently returns stale conditioning
+        # from an unrelated prompt. Clear it at the start of every generation.
+        _raw_dit(self.transformer).clear_text_proj_cache()
 
         sampling = req.sampling_params
         height = sampling.height or 512
