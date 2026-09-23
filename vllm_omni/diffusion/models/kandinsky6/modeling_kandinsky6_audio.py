@@ -31,7 +31,7 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from einops import rearrange
 from huggingface_hub import PyTorchModelHubMixin, hf_hub_download
-from librosa.filters import mel as librosa_mel_fn
+from vllm_omni.utils.audio import mel_filter_bank
 from torch import nn, pow, sin
 from torch.nn import Conv1d, ConvTranspose1d, Parameter
 from torch.nn import functional as F
@@ -1553,10 +1553,11 @@ class MelConverter(nn.Module):
         self.fmax = fmax
         self.norm_fn = norm_fn
 
-        mel = librosa_mel_fn(
+        # torchaudio Slaney filterbank — numerically matches librosa.filters.mel
+        # (the repo bans librosa; see vllm_omni/utils/audio.py).
+        mel_basis = mel_filter_bank(
             sr=self.sampling_rate, n_fft=self.n_fft, n_mels=self.num_mels, fmin=self.fmin, fmax=self.fmax
-        )
-        mel_basis = torch.from_numpy(mel).float()
+        ).float()
         hann_window = torch.hann_window(self.win_size)
 
         self.register_buffer("mel_basis", mel_basis)

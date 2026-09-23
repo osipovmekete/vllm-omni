@@ -222,6 +222,46 @@ def test_single_modality_through_multimodal_model(modality):
         assert out.shape == (audio_len, 6)
 
 
+@pytest.mark.parametrize("batched", [False, True])
+def test_self_attention_attends_over_tokens_for_batched_and_unbatched_inputs(batched):
+    """Self-attention must contract over the *token* axis whether its input is
+    unbatched text ``(S, C)`` or batched=1 visual/audio ``(1, N, C)``.
+
+    Regression: an unconditional ``unsqueeze(0)`` on the already-batched
+    visual path handed SDPA a 5-D ``(1, 1, N, H, D)`` tensor, which it
+    accepts silently but then treats the head axis as the sequence — every
+    generated video decoded to pure noise."""
+    from vllm_omni.diffusion.models.kandinsky6.modeling_kandinsky6 import Kandinsky6Attention, apply_rotary
+
+    torch.manual_seed(0)
+    channels, head_dim, tokens = 24, 12, 7
+    attn = Kandinsky6Attention(channels, head_dim, engine="sdpa").eval()
+    with torch.no_grad():
+        # vLLM parallel linears allocate with torch.empty (no init).
+        for param in attn.parameters():
+            param.normal_(std=0.2)
+    x = torch.randn(tokens, channels)
+    rope = torch.randn(tokens, 1, head_dim // 2, 2, 2)
+    hidden = x.unsqueeze(0) if batched else x
+
+    with torch.no_grad():
+        out = attn(hidden, rotary_emb=rope)
+
+        heads = channels // head_dim
+        q = attn.query_norm(attn.to_query(x).reshape(tokens, heads, head_dim))
+        k = attn.key_norm(attn.to_key(x).reshape(tokens, heads, head_dim))
+        v = attn.to_value(x).reshape(tokens, heads, head_dim)
+        q = apply_rotary(q, rope).type_as(q)
+        k = apply_rotary(k, rope).type_as(k)
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)
+        ).transpose(0, 1)
+        expected = attn.out_layer(ref.reshape(tokens, channels))
+
+    assert out.shape == (hidden.shape[:-1] + (channels,))
+    torch.testing.assert_close(out.reshape(tokens, channels), expected, rtol=1e-4, atol=1e-5)
+
+
 def test_modulation_projections_are_zero_initialized():
     """Modulation layers are zero-initialized at construction (standard
     AdaLN-zero init) — confirms the zero-init in Kandinsky6Modulation.__init__

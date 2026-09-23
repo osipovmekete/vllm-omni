@@ -15,6 +15,7 @@ imports, exactly like vLLM-Omni's other native pipelines (e.g.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 from collections.abc import Iterable
@@ -36,6 +37,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.interface import SupportAudioOutput, SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.utils import _load_json
+from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
@@ -235,9 +237,11 @@ def compute_rope1d(rope: nn.Module, length: int, device: torch.device | None = N
     """Build 1-D RoPE for positions ``0..length-1``."""
     if length < 1:
         raise ValueError(f"rope length must be positive, got {length}")
-    dev = device if device is not None else next(rope.buffers()).device
-    pos = torch.arange(length, device=dev)
-    return rope(pos)
+    # Index the table where it lives (the DiT may still be CPU-resident under
+    # sequential offload) and move the small result to the requested device.
+    table_device = next(rope.buffers()).device
+    out = rope(torch.arange(length, device=table_device))
+    return out if device is None or out.device == torch.device(device) else out.to(device)
 
 
 def compute_visual_rope(
@@ -250,28 +254,30 @@ def compute_visual_rope(
     T, H, W = (int(shape[0]), int(shape[1]), int(shape[2]))
     if T < 1 or H < 1 or W < 1:
         raise ValueError(f"visual rope shape must be positive, got {shape}")
-    dev = device if device is not None else next(rope.buffers()).device
+    table_device = next(rope.buffers()).device
     pos = [
-        torch.arange(T, device=dev),
-        torch.arange(H, device=dev),
-        torch.arange(W, device=dev),
+        torch.arange(T, device=table_device),
+        torch.arange(H, device=table_device),
+        torch.arange(W, device=table_device),
     ]
     scale = (float(scale_factor[0]), float(scale_factor[1]), float(scale_factor[2]))
-    return rope((T, H, W), pos, scale)
+    out = rope((T, H, W), pos, scale)
+    return out if device is None or out.device == torch.device(device) else out.to(device)
 
 
 @torch.no_grad()
 def postprocess_audio(
     bundle: LatentBundle,
     audio_vae,
-    normalization_mode: str = "clip",
+    normalization_mode: str = "normalize",
 ) -> list[np.ndarray] | None:
     """Decode audio latents → list of (samples,) int16 numpy arrays.
 
     Returns None when bundle.audio is None (T2V mode).
 
+    ``normalize`` (default, matches the k6_video production pipeline)
+    peak-normalizes each waveform before converting it to int16.
     ``clip`` preserves the decoded amplitude and saturates it to [-1, 1].
-    ``normalize`` peak-normalizes each waveform before converting it to int16.
     """
     audio = bundle.audio
     if audio is None:
@@ -714,28 +720,111 @@ _DEFAULT_NEGATIVE_PROMPT = (
 )
 
 
+_TRANSFORMER_WEIGHTS_NAME = "diffusion_pytorch_model.safetensors"
+
+
+def _transformer_shard_files(transformer_dir: str) -> list[str]:
+    index_path = os.path.join(transformer_dir, f"{_TRANSFORMER_WEIGHTS_NAME}.index.json")
+    if os.path.isfile(index_path):
+        with open(index_path, encoding="utf-8") as f:
+            weight_map = json.load(f)["weight_map"]
+        return [os.path.join(transformer_dir, name) for name in sorted(set(weight_map.values()))]
+    single = os.path.join(transformer_dir, _TRANSFORMER_WEIGHTS_NAME)
+    if os.path.isfile(single):
+        return [single]
+    raise FileNotFoundError(f"No {_TRANSFORMER_WEIGHTS_NAME}[.index.json] under {transformer_dir}")
+
+
+def _load_transformer_from_bundle(
+    transformer_dir: str,
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> Kandinsky6Transformer3DModel:
+    """Fast path for the ~28B-parameter DiT.
+
+    ``ModelMixin.from_pretrained`` cannot use its meta-device fast-init here
+    (accelerate's ``register_empty_parameter`` does not know vLLM's
+    ``RowvLLMParameter``/``ColumnvLLMParameter`` signatures), and its
+    ``low_cpu_mem_usage=False`` fallback allocates + copies every tensor on
+    the CPU (~8 min for 56 GiB, disk read is <1 min). Instead:
+
+    1. build the module on CPU with weight init skipped (untouched virtual
+       allocation, so it costs nothing) — this also materialises the
+       non-persistent RoPE / timestep buffers that live outside the state dict;
+    2. read the safetensors shards directly onto ``device`` and hand the
+       tensors to the module with ``load_state_dict(assign=True)``.
+    """
+    from diffusers.models.modeling_utils import no_init_weights
+    from safetensors import safe_open
+
+    config = Kandinsky6Transformer3DModel.load_config(transformer_dir)
+    with torch.device("cpu"), no_init_weights():
+        transformer = Kandinsky6Transformer3DModel.from_config(config)
+
+    state: dict[str, Tensor] = {}
+    for shard in _transformer_shard_files(transformer_dir):
+        with safe_open(shard, framework="pt", device=str(device)) as f:
+            for key in f.keys():
+                tensor = f.get_tensor(key)
+                if tensor.is_floating_point() and tensor.dtype != dtype:
+                    tensor = tensor.to(dtype)
+                state[key] = tensor
+    result = transformer.load_state_dict(state, strict=False, assign=True)
+    if result.missing_keys or result.unexpected_keys:
+        raise RuntimeError(
+            "Kandinsky6Transformer3DModel checkpoint mismatch: "
+            f"{len(result.missing_keys)} missing (e.g. {result.missing_keys[:5]}), "
+            f"{len(result.unexpected_keys)} unexpected (e.g. {result.unexpected_keys[:5]})"
+        )
+    del state
+    # Buffers were built on CPU; parameters were assigned on ``device``.
+    for name, buf in transformer.named_buffers():
+        if buf.device != device:
+            module_name, _, buf_name = name.rpartition(".")
+            transformer.get_submodule(module_name)._buffers[buf_name] = buf.to(device=device)
+    transformer.requires_grad_(False)
+    return transformer.eval()
+
+
 def get_kandinsky6_post_process_func(od_config: OmniDiffusionConfig):
     """Factory returning the post-process function registered in
     ``vllm_omni/diffusion/registry.py``'s ``_DIFFUSION_POST_PROCESS_FUNCS``.
 
     Unpacks the ``(video, audio)`` pair set on ``DiffusionOutput.output`` by
-    ``Kandinsky6TI2VAPipeline.forward`` into the ``{"video": ..., "audio":
-    ..., "audio_sample_rate": ...}`` payload shape the framework's shared
-    audio-output plumbing (``io_support.py`` -> ``output_formatter.py`` ->
-    ``media_utils.py`` PyAV muxing) already expects — the same shape
-    MiniMax H3's own post-process function produces, so a synced-audio MP4
-    response comes for free with no new plumbing.
+    ``Kandinsky6TI2VAPipeline.forward`` into the flat ``{"video": ...,
+    "audio": ..., "audio_sample_rate": ..., "fps": ...}`` payload the
+    framework's shared audio-output plumbing (``io_support.py`` ->
+    ``output_formatter.py`` -> ``media_utils.py`` PyAV muxing) already
+    expects — the same shape MiniMax H3's post-process function produces.
+    ``output_formatter.normalize_diffusion_postprocess_output`` lifts
+    ``audio_sample_rate``/``fps`` from this flat form into metadata; wrapping
+    it in a ``{"payload", "metadata"}`` envelope instead would silently drop
+    the sample rate (the envelope path only reads
+    ``metadata["audio"]["sample_rate"]``) and the MP4 would be muxed at the
+    24 kHz default, i.e. ~1.8x too slow.
+
+    ``postprocess_audio`` emits int16 PCM; the muxer (and the OpenAI video
+    route) consume float32 in ``[-1, 1]``, so the waveform is rescaled here.
     """
+    model_config = dict(getattr(od_config, "model_config", None) or {})
+    fps = float(model_config.get("sample_fps", 24.0))
 
     def post_process_func(output, output_type: str = "np", sampling_params=None):
         video, audio = output["video"], output["audio"]
-        payload: dict[str, object] = {"video": video}
+        payload: dict[str, object] = {"video": video, "fps": fps}
         if audio is not None:
+            waveform = audio[0] if isinstance(audio, list) else audio
+            if isinstance(waveform, torch.Tensor):
+                waveform = waveform.detach().cpu().numpy()
+            waveform = np.asarray(waveform)
+            if np.issubdtype(waveform.dtype, np.integer):
+                waveform = waveform.astype(np.float32) / float(np.iinfo(waveform.dtype).max)
+            payload["audio"] = waveform.astype(np.float32, copy=False)
             audio_sample_rate = output.get("audio_sample_rate")
-            payload["audio"] = audio[0] if isinstance(audio, list) else audio
             if audio_sample_rate is not None:
                 payload["audio_sample_rate"] = int(audio_sample_rate)
-        return {"payload": payload, "metadata": {}}
+        return payload
 
     return post_process_func
 
@@ -846,9 +935,32 @@ class Kandinsky6TI2VAPipeline(
         self.max_sequence_length = max_sequence_length
         self.text_token_padding = text_token_padding
 
+        # Keep ``self.device`` on the accelerator even when components were
+        # loaded to CPU for the offload backend: latents/RoPE live on the GPU
+        # and the sequential-offload hooks move the DiT there on first forward.
         first_parameter = next(self.transformer.parameters(), None)
-        if first_parameter is not None:
+        if first_parameter is not None and first_parameter.device.type != "cpu":
             self.device = first_parameter.device
+
+        # Layerwise offload streams the DiT block-by-block (~20 GiB footprint
+        # instead of the 56 GiB resident bf16 DiT). The block-list names depend
+        # on the checkpoint flavour (multimodal TI2VA vs. video-only), so the
+        # plan is declared per instance from what the transformer actually has.
+        block_attrs = tuple(
+            name
+            for name in (
+                "text_transformer_blocks",
+                "video_text_transformer_blocks",
+                "audio_text_transformer_blocks",
+                "visual_transformer_blocks",
+            )
+            if isinstance(getattr(_raw_dit(self.transformer), name, None), nn.ModuleList)
+        )
+        if block_attrs:
+            self._offload_plan = OffloadPlan(
+                block_attrs={"transformer": block_attrs},
+                resident_dit_paths=frozenset({"transformer"}),
+            )
 
         if od_config is not None:
             self.setup_diffusion_pipeline_profiler(
@@ -872,25 +984,29 @@ class Kandinsky6TI2VAPipeline(
         dtype = getattr(od_config, "dtype", torch.bfloat16)
         model_config = dict(od_config.model_config or {})
 
+        # With any CPU-offload strategy the framework loader constructs the
+        # pipeline under a CPU device context and the offload backend owns
+        # GPU placement afterwards (encoders/VAEs pinned, DiT swapped in on
+        # forward). Loading straight to the GPU here would OOM: the bf16 DiT
+        # alone is ~56 GiB and Qwen2.5-VL-7B another ~17 GiB.
+        offload_requested = bool(
+            getattr(od_config, "enable_cpu_offload", False)
+            or getattr(od_config, "enable_layerwise_offload", False)
+            or getattr(od_config, "enable_distributed_layerwise_offload", False)
+        )
+        load_device = torch.device("cpu") if offload_requested else self.device
+
         transformer_dir = os.path.join(model_root, "transformer")
-        # low_cpu_mem_usage=False: diffusers' default meta-device fast-init path
-        # (accelerate.init_empty_weights) monkey-patches register_parameter to
-        # accelerate's register_empty_parameter, which only knows the plain
-        # torch.nn.Parameter signature. vLLM's RowvLLMParameter/ColumnvLLMParameter
-        # (used throughout this model's ColumnParallelLinear/RowParallelLinear
-        # layers) require an input_dim kwarg accelerate can't supply, so the
-        # meta-device path must be disabled here (same fix as
-        # dynin_omni_token2audio.py's AutoModel.from_pretrained call).
-        transformer = Kandinsky6Transformer3DModel.from_pretrained(
-            transformer_dir, torch_dtype=dtype, low_cpu_mem_usage=False
-        ).to(self.device)
+        transformer = _load_transformer_from_bundle(transformer_dir, dtype=dtype, device=load_device)
 
         vae_dir = os.path.join(model_root, "vae")
-        vae = AutoencoderKLHunyuanVideo.from_pretrained(vae_dir, torch_dtype=torch.float16).to(self.device).eval()
+        vae = AutoencoderKLHunyuanVideo.from_pretrained(vae_dir, torch_dtype=torch.float16).to(load_device).eval()
 
         text_encoder_dir = os.path.join(model_root, "text_encoder")
-        text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(text_encoder_dir, torch_dtype=dtype).to(
-            self.device
+        text_encoder = (
+            Qwen2_5_VLForConditionalGeneration.from_pretrained(text_encoder_dir, torch_dtype=dtype)
+            .to(load_device)
+            .eval()
         )
         # Tokenizer/processor files live in the sibling `tokenizer/` directory
         # (standard Diffusers multi-component layout), not inside
@@ -904,13 +1020,13 @@ class Kandinsky6TI2VAPipeline(
         tokenizer.tokenizer.padding_side = "right"
 
         clip_dir = os.path.join(model_root, "text_encoder_2")
-        text_encoder_2 = CLIPTextModel.from_pretrained(clip_dir, torch_dtype=dtype).to(self.device)
+        text_encoder_2 = CLIPTextModel.from_pretrained(clip_dir, torch_dtype=dtype).to(load_device).eval()
         tokenizer_2 = CLIPTokenizer.from_pretrained(os.path.join(model_root, "tokenizer_2"))
 
         audio_vae = None
         audio_vae_dir = os.path.join(model_root, "audio_vae")
         if bool(model_config.get("sample_audio", True)) and os.path.isdir(audio_vae_dir):
-            audio_vae = Kandinsky6AudioVAE.from_pretrained(audio_vae_dir, torch_dtype=dtype).to(self.device).eval()
+            audio_vae = Kandinsky6AudioVAE.from_pretrained(audio_vae_dir, torch_dtype=dtype).to(load_device).eval()
 
         # model_config never actually carries a "scheduler_scale" key in
         # practice (nothing populates it from the checkpoint), so this always
@@ -959,7 +1075,10 @@ class Kandinsky6TI2VAPipeline(
 
     def encode_prompt(self, text: str) -> tuple[TextEmbeds, Tensor, Tensor | None]:
         full_text = _PROMPT_TEMPLATE.format(text)
-        qwen_device = next(self.text_encoder.parameters()).device
+        # Inputs go to the execution device, not the encoder's current one:
+        # under sequential offload the encoders rest on CPU between requests
+        # and are swapped onto the GPU by the hook when their forward runs.
+        qwen_device = self.device
         inputs = self.tokenizer(
             text=[full_text],
             images=None,
@@ -985,7 +1104,7 @@ class Kandinsky6TI2VAPipeline(
             qwen_attention = None
             cu_seqlens = torch.tensor([0, int(attention.sum().item())], dtype=torch.int32, device=embeds.device)
 
-        clip_device = next(self.text_encoder_2.parameters()).device
+        clip_device = self.device
         clip_inputs = self.tokenizer_2(
             [text],
             max_length=_CLIP_MAX_LENGTH,
@@ -1158,13 +1277,25 @@ class Kandinsky6TI2VAPipeline(
     def __call__(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         return self.forward(req)
 
+    @torch.no_grad()
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         if len(req.prompts) != 1:
             raise ValueError("Kandinsky6TI2VAPipeline currently supports exactly one prompt per request.")
         prompt_obj = req.prompts[0]
         prompt = prompt_obj if isinstance(prompt_obj, str) else (prompt_obj.get("prompt") or "")
         negative_prompt = "" if isinstance(prompt_obj, str) else (prompt_obj.get("negative_prompt") or "")
-        image = None if isinstance(prompt_obj, str) else prompt_obj.get("image")
+        image = None
+        if not isinstance(prompt_obj, str):
+            # The framework's request envelope carries reference images under
+            # ``multi_modal_data.image`` (see sana_video / wan2_2 I2V); keep the
+            # bare ``image`` key for direct/legacy callers.
+            image = (prompt_obj.get("multi_modal_data") or {}).get("image")
+            if image is None:
+                image = prompt_obj.get("image")
+            if isinstance(image, (list, tuple)):
+                if len(image) > 1:
+                    raise ValueError("Kandinsky6TI2VAPipeline accepts at most one reference image.")
+                image = image[0] if image else None
         if not prompt:
             raise ValueError("Prompt is required for Kandinsky 6 generation.")
 
@@ -1186,6 +1317,9 @@ class Kandinsky6TI2VAPipeline(
         guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else 5.0
         extra_args = sampling.extra_args or {}
         sample_audio = bool(extra_args.get("sample_audio", True))
+        # ``normalize`` (peak-normalize each waveform) matches the k6_video
+        # production pipeline; ``clip`` keeps the raw decoded amplitude.
+        audio_normalization = str(extra_args.get("audio_normalization", "normalize"))
         visual_cond_scheme = extra_args.get("visual_cond_scheme") or ("tail_cond_first_frame" if image else "pretrain")
 
         generator = sampling.generator
@@ -1290,7 +1424,9 @@ class Kandinsky6TI2VAPipeline(
             decoded = postprocess_video(result, self.vae, bs=1)
             video_out = decoded.permute(0, 2, 3, 4, 1).cpu().numpy()
 
-        audio_out = postprocess_audio(result, self.audio_vae) if sample_audio else None
+        audio_out = (
+            postprocess_audio(result, self.audio_vae, normalization_mode=audio_normalization) if sample_audio else None
+        )
         audio_sample_rate = self.audio_sample_rate if audio_out is not None else None
         return DiffusionOutput(output={"video": video_out, "audio": audio_out, "audio_sample_rate": audio_sample_rate})
 

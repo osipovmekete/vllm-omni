@@ -77,21 +77,44 @@ class _FakeAudioVAE:
 def test_kandinsky6_post_process_func_packages_video_and_audio():
     """Pure-function test: no model/weights needed. Confirms the post-process
     payload shape matches what io_support.py -> output_formatter.py ->
-    media_utils.py's PyAV muxing expects (the same {"video", "audio",
-    "audio_sample_rate"} shape MiniMax H3's own post-process function
-    produces)."""
+    media_utils.py's PyAV muxing expects (the same flat {"video", "audio",
+    "audio_sample_rate", "fps"} shape MiniMax H3's own post-process function
+    produces), and that int16 PCM from ``postprocess_audio`` is rescaled to
+    the float32 [-1, 1] waveform the muxer consumes."""
     from vllm_omni.diffusion.models.kandinsky6 import get_kandinsky6_post_process_func
 
     post_process = get_kandinsky6_post_process_func(od_config=None)
     video = np.zeros((1, 4, 8, 8, 3), dtype=np.uint8)
-    audio = np.zeros((100,), dtype=np.int16)
+    audio = np.array([0, 32767, -32767], dtype=np.int16)
 
     result = post_process({"video": video, "audio": audio, "audio_sample_rate": 44100}, output_type="np")
 
-    assert result["payload"]["video"] is video
-    assert result["payload"]["audio"] is audio
-    assert result["payload"]["audio_sample_rate"] == 44100
-    assert result["metadata"] == {}
+    assert result["video"] is video
+    assert result["audio"].dtype == np.float32
+    np.testing.assert_allclose(result["audio"], [0.0, 1.0, -1.0])
+    assert result["audio_sample_rate"] == 44100
+    assert result["fps"] == 24.0
+
+
+def test_kandinsky6_post_process_sample_rate_survives_output_formatter():
+    """The formatter only lifts ``audio_sample_rate`` into metadata from the
+    flat payload form; an envelope would silently lose it and the MP4 would
+    be muxed at the 24 kHz default."""
+    from vllm_omni.diffusion.models.kandinsky6 import get_kandinsky6_post_process_func
+    from vllm_omni.diffusion.output_formatter import normalize_diffusion_postprocess_output
+
+    post_process = get_kandinsky6_post_process_func(od_config=None)
+    video = np.zeros((1, 2, 4, 4, 3), dtype=np.uint8)
+    audio = np.zeros((10,), dtype=np.int16)
+
+    normalized = normalize_diffusion_postprocess_output(
+        post_process({"video": video, "audio": audio, "audio_sample_rate": 44100}, output_type="np")
+    )
+
+    assert normalized.primary_key == "video"
+    assert normalized.metadata["audio"]["sample_rate"] == 44100
+    assert normalized.metadata["video"]["fps"] == 24.0
+    assert "audio_sample_rate" not in normalized.outputs
 
 
 def test_kandinsky6_post_process_func_omits_audio_when_none():
@@ -102,9 +125,9 @@ def test_kandinsky6_post_process_func_omits_audio_when_none():
 
     result = post_process({"video": video, "audio": None, "audio_sample_rate": None}, output_type="np")
 
-    assert result["payload"]["video"] is video
-    assert "audio" not in result["payload"]
-    assert "audio_sample_rate" not in result["payload"]
+    assert result["video"] is video
+    assert "audio" not in result
+    assert "audio_sample_rate" not in result
 
 
 def test_kandinsky6_post_process_func_unwraps_batched_audio_list():
@@ -112,11 +135,63 @@ def test_kandinsky6_post_process_func_unwraps_batched_audio_list():
 
     post_process = get_kandinsky6_post_process_func(od_config=None)
     video = np.zeros((1, 2, 4, 4, 3), dtype=np.uint8)
-    audio_item = np.zeros((50,), dtype=np.int16)
+    audio_item = np.full((50,), 16384, dtype=np.int16)
 
     result = post_process({"video": video, "audio": [audio_item], "audio_sample_rate": 44100}, output_type="np")
 
-    assert result["payload"]["audio"] is audio_item
+    assert result["audio"].shape == (50,)
+    np.testing.assert_allclose(result["audio"], 16384 / 32767, rtol=1e-6)
+
+
+class _StubAudioVAE:
+    """Audio VAE stand-in: identity "decode" that returns the latent as a waveform."""
+
+    scaling_factor = 0.5
+    mean_value = 0.0
+    device = "cpu"
+
+    def wrapped_decode(self, latents):
+        # (1, audio_dim, A) -> (A,) waveform: take the first channel.
+        return latents[0, 0]
+
+
+def test_postprocess_audio_normalizes_by_default_and_clips_on_request():
+    """The default mode must match the k6_video production pipeline, which
+    peak-normalizes each decoded waveform to full scale; ``clip`` keeps the
+    raw amplitude (saturated to [-1, 1]) for callers that want it."""
+    import torch
+
+    from vllm_omni.diffusion.models.kandinsky6.pipeline_kandinsky6 import LatentBundle, postprocess_audio
+
+    # Latent (A=4, audio_dim=1); the stub scales by 1/scaling_factor -> [0.2, -0.4, 0.6, 3.0].
+    audio = torch.tensor([[0.1], [-0.2], [0.3], [1.5]], dtype=torch.float32)
+    bundle = LatentBundle(
+        video=None,
+        audio=audio,
+        video_cu_seqlens=None,
+        audio_cu_seqlens=torch.tensor([0, 4], dtype=torch.int32),
+    )
+    vae = _StubAudioVAE()
+
+    normalized = postprocess_audio(bundle, vae)
+    assert normalized is not None and len(normalized) == 1
+    assert normalized[0].dtype == np.int16
+    np.testing.assert_allclose(
+        normalized[0].astype(np.float32) / 32767,
+        np.array([0.2, -0.4, 0.6, 3.0], dtype=np.float32) / 3.0,
+        atol=1e-4,
+    )
+
+    clipped = postprocess_audio(bundle, vae, normalization_mode="clip")
+    np.testing.assert_allclose(
+        clipped[0].astype(np.float32) / 32767,
+        np.array([0.2, -0.4, 0.6, 1.0], dtype=np.float32),
+        atol=1e-4,
+    )
+
+    assert postprocess_audio(LatentBundle(None, None, None, None), vae) is None
+    with pytest.raises(ValueError, match="normalization_mode"):
+        postprocess_audio(bundle, vae, normalization_mode="loud")
 
 
 def test_kandinsky6_pre_process_func_is_identity_for_now():

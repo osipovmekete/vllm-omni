@@ -649,15 +649,19 @@ class Kandinsky6Attention(nn.Module):
             key = apply_rotary(key, rotary_emb_kv).type_as(key)
 
         if is_self_attention:
-            # FA3/FA2/SDPA dispatch requires a batch dimension (B, S, H, D).
-            # Text self-attention's `hidden_states` is unbatched ((S, H, D)
-            # after reshape); visual self-attention's is already batched=1
-            # ((1, N, H, D)) since `_embed_visual` unsqueezes it upstream.
-            # Unconditionally adding one more here and stripping exactly
-            # that layer off the output afterward handles both uniformly
-            # (matches core/components/dit.py's MultiheadSelfAttentionEnc/Dec).
-            query, key, value = query.unsqueeze(0), key.unsqueeze(0), value.unsqueeze(0)
-            strip_output_batch = True
+            # FA3/FA2/SDPA dispatch requires exactly (B, S, H, D). Text
+            # self-attention's `hidden_states` is unbatched ((S, H, D) after
+            # reshape) and needs a batch dim added; visual/audio self-attention
+            # is already batched=1 ((1, N, H, D)) because `_embed_visual` /
+            # `_embed_audio` unsqueeze upstream. Adding a batch dim
+            # unconditionally would hand SDPA a 5-D (1, 1, N, H, D) tensor,
+            # which it happily accepts — but then it treats the *head* axis
+            # as the sequence and attends across heads instead of tokens
+            # (matches core/components/dit.py: MultiheadSelfAttentionEnc
+            # unsqueezes, MultiheadSelfAttentionDec does not).
+            strip_output_batch = query.dim() == 3
+            if strip_output_batch:
+                query, key, value = query.unsqueeze(0), key.unsqueeze(0), value.unsqueeze(0)
         else:
             # Cross-attention: the query side (always visual, or the
             # opposite modality for cross-modal attention) already carries
