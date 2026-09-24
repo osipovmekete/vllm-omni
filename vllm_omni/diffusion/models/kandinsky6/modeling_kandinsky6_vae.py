@@ -22,6 +22,7 @@ from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
@@ -31,6 +32,12 @@ from diffusers.models.autoencoders.vae import DecoderOutput, DiagonalGaussianDis
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.utils.accelerate_utils import apply_forward_hook
+from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import (
+    DistributedOperator,
+    DistributedVaeMixin,
+    GridSpec,
+    TileTask,
+)
 
 
 def prepare_causal_attention_mask(f: int, s: int, dtype: torch.dtype, device: torch.device, b: int) -> torch.Tensor:
@@ -590,7 +597,7 @@ class HunyuanVideoDecoder3D(nn.Module):
         return hidden_states
 
 
-class AutoencoderKLHunyuanVideo(ModelMixin, ConfigMixin):
+class AutoencoderKLHunyuanVideo(ModelMixin, ConfigMixin, DistributedVaeMixin):
     r"""
     A VAE model with KL loss for encoding videos into latents
     and decoding latent representations into videos.
@@ -681,6 +688,75 @@ class AutoencoderKLHunyuanVideo(ModelMixin, ConfigMixin):
         self.tile_sample_stride_num_frames = 12
 
         self.tile_size = None
+        self.distributed_executor = None
+
+    def set_parallel_size(self, parallel_size: int, mode: str = "tile") -> None:
+        if self.distributed_executor is None:
+            self.init_distributed()
+        super().set_parallel_size(parallel_size, mode=mode)
+
+    def _decode_tile_params(self) -> tuple[int, int, int, int]:
+        ratio = int(self.spatial_compression_ratio)
+        return (
+            self.tile_sample_min_height // ratio,
+            self.tile_sample_min_width // ratio,
+            self.tile_sample_stride_height // ratio,
+            self.tile_sample_stride_width // ratio,
+        )
+
+    def _decode_tile_split(self, z: torch.Tensor) -> tuple[list[TileTask], GridSpec]:
+        """Same spatial tiles as ``tiled_decode``, one task per tile."""
+        _, _, _, height, width = z.shape
+        tile_h, tile_w, stride_h, stride_w = self._decode_tile_params()
+        h_starts = list(range(0, height - tile_h + 1, stride_h))
+        w_starts = list(range(0, width - tile_w + 1, stride_w))
+        tasks: list[TileTask] = []
+        for row, i in enumerate(h_starts):
+            for col, j in enumerate(w_starts):
+                tile = z[:, :, :, i : i + tile_h, j : j + tile_w]
+                tasks.append(
+                    TileTask(
+                        tile_id=len(tasks),
+                        grid_coord=(row, col),
+                        tensor=tile,
+                        workload=int(tile.shape[-2] * tile.shape[-1]),
+                    )
+                )
+        spec = GridSpec(
+            split_dims=(3, 4),
+            grid_shape=(len(h_starts), len(w_starts)),
+            tile_spec={
+                "sample_height": height * int(self.spatial_compression_ratio),
+                "sample_width": width * int(self.spatial_compression_ratio),
+            },
+            output_dtype=z.dtype,
+        )
+        return tasks, spec
+
+    def _decode_tile_exec(self, task: TileTask) -> torch.Tensor:
+        return self.decoder(self.post_quant_conv(task.tensor))
+
+    def _decode_tile_merge(
+        self, coord_tensor_map: dict[tuple[int, ...], torch.Tensor], grid_spec: GridSpec
+    ) -> torch.Tensor:
+        n_rows, n_cols = grid_spec.grid_shape
+        blend_height = self.tile_sample_min_height - self.tile_sample_stride_height
+        blend_width = self.tile_sample_min_width - self.tile_sample_stride_width
+        rows = [[coord_tensor_map[(i, j)] for j in range(n_cols)] for i in range(n_rows)]
+        result_rows = []
+        for i, row in enumerate(rows):
+            result_row = []
+            for j, tile in enumerate(row):
+                if i > 0:
+                    tile = self.blend_v(rows[i - 1][j], tile, blend_height)
+                if j > 0:
+                    tile = self.blend_h(row[j - 1], tile, blend_width)
+                height_lim = self.tile_sample_min_height if i == n_rows - 1 else self.tile_sample_stride_height
+                width_lim = self.tile_sample_min_width if j == n_cols - 1 else self.tile_sample_stride_width
+                result_row.append(tile[:, :, :, :height_lim, :width_lim])
+            result_rows.append(torch.cat(result_row, dim=-1))
+        dec = torch.cat(result_rows, dim=3)
+        return dec[:, :, :, : grid_spec.tile_spec["sample_height"], : grid_spec.tile_spec["sample_width"]]
 
     def _encode(self, x: torch.Tensor) -> torch.Tensor:
         _, _, num_frames, height, width = x.shape
@@ -874,6 +950,20 @@ class AutoencoderKLHunyuanVideo(ModelMixin, ConfigMixin):
         sample_height = height * self.spatial_compression_ratio
         sample_width = width * self.spatial_compression_ratio
 
+        if self.distributed_executor is not None and self.is_distributed_enabled():
+            decoded = self.distributed_executor.execute(
+                z,
+                DistributedOperator(
+                    split=self._decode_tile_split,
+                    exec=self._decode_tile_exec,
+                    merge=self._decode_tile_merge,
+                ),
+                broadcast_result=True,
+            )
+            if not return_dict:
+                return (decoded,)
+            return DecoderOutput(sample=decoded)
+
         tile_latent_min_height = self.tile_sample_min_height // self.spatial_compression_ratio
         tile_latent_min_width = self.tile_sample_min_width // self.spatial_compression_ratio
         tile_latent_stride_height = self.tile_sample_stride_height // self.spatial_compression_ratio
@@ -1042,6 +1132,17 @@ class AutoencoderKLHunyuanVideo(ModelMixin, ConfigMixin):
             device = next(self.parameters()).device
         device = torch.device(device)
         free_mem = torch.cuda.mem_get_info(device=device)[0] if device.type == "cuda" else float("inf")
+        executor = self.distributed_executor
+        if (
+            device.type == "cuda"
+            and executor is not None
+            and executor.parallel_size > 1
+            and dist.is_initialized()
+            and self.use_tiling
+        ):
+            free = torch.tensor([int(free_mem)], device=device, dtype=torch.int64)
+            dist.all_reduce(free, op=dist.ReduceOp.MIN, group=executor.group)
+            free_mem = float(free.item())
         max_area = free_mem / 256 / 17 / 8
         num_vals = 256 * 17 * (h + 32) * (w + 32)
 

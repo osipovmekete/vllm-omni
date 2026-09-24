@@ -596,18 +596,63 @@ def denoise_loop(  # noqa: PLR0912, PLR0913, PLR0915
                 visual_token_type_ids=visual_token_type_ids,
             )
 
-        with _cache_scope("cond"):
-            vel_cond = _forward(
-                text_embeds["text_embeds"],
-                text_embeds["pooled_embed"],
-                text_rope,
-                attention_mask,
-            )
-        if abs(guidance_weight - 1.0) > guidance_epsilon:
-            with _cache_scope("uncond"):
-                vel_uncond = _forward(null_te, null_pe, null_rope, null_attention_mask)
+        cache = getattr(raw, "_k6_step_cache", None)
+        if cache is not None and cache.should_skip(step_index):
+            vel_cond, vel_uncond = cache.last_cond, cache.last_uncond
         else:
-            vel_uncond = vel_cond
+            use_cfg = abs(guidance_weight - 1.0) > guidance_epsilon
+            cfg_world = 1
+            cfg_rank = 0
+            try:
+                from vllm_omni.diffusion.distributed.parallel_state import (
+                    get_cfg_group,
+                    get_classifier_free_guidance_rank,
+                    get_classifier_free_guidance_world_size,
+                    is_cfg_group_initialized,
+                )
+
+                if is_cfg_group_initialized():
+                    cfg_world = int(get_classifier_free_guidance_world_size())
+                    cfg_rank = int(get_classifier_free_guidance_rank())
+            except Exception:
+                cfg_world = 1
+            if cfg_world > 1 and use_cfg:
+                # Rank 0 runs the conditional DiT, rank 1 the unconditional one,
+                # then both ranks all-gather so apply_cfg sees both velocities.
+                cfg_group = get_cfg_group()
+                if cfg_rank == 0:
+                    with _cache_scope("cond"):
+                        local = _forward(
+                            text_embeds["text_embeds"],
+                            text_embeds["pooled_embed"],
+                            text_rope,
+                            attention_mask,
+                        )
+                else:
+                    with _cache_scope("uncond"):
+                        local = _forward(null_te, null_pe, null_rope, null_attention_mask)
+                if isinstance(local, tuple):
+                    gathered = [cfg_group.all_gather(part, separate_tensors=True) for part in local]
+                    vel_cond = tuple(parts[0] for parts in gathered)
+                    vel_uncond = tuple(parts[1] for parts in gathered)
+                else:
+                    gathered = cfg_group.all_gather(local, separate_tensors=True)
+                    vel_cond, vel_uncond = gathered[0], gathered[1]
+            else:
+                with _cache_scope("cond"):
+                    vel_cond = _forward(
+                        text_embeds["text_embeds"],
+                        text_embeds["pooled_embed"],
+                        text_rope,
+                        attention_mask,
+                    )
+                if use_cfg:
+                    with _cache_scope("uncond"):
+                        vel_uncond = _forward(null_te, null_pe, null_rope, null_attention_mask)
+                else:
+                    vel_uncond = vel_cond
+            if cache is not None:
+                cache.store(vel_cond, vel_uncond)
 
         # Step per modality. A single scheduler step is consumed for each
         # denoising iteration; when both modalities are sampled, the same
@@ -735,50 +780,150 @@ def _transformer_shard_files(transformer_dir: str) -> list[str]:
     raise FileNotFoundError(f"No {_TRANSFORMER_WEIGHTS_NAME}[.index.json] under {transformer_dir}")
 
 
+def _shard_loaded_weight(param: nn.Parameter, loaded_weight: Tensor) -> Tensor:
+    """Slice a full checkpoint tensor the way ``ColumnParallelLinear`` /
+    ``RowParallelLinear.weight_loader`` would, without requiring the
+    parameter storage to already be allocated.
+
+    Column weights/biases carry ``output_dim``; row weights carry
+    ``input_dim``. Row biases are replicated (shapes already match).
+    """
+    if getattr(param, "is_sharded_weight", False):
+        return loaded_weight
+    loader = getattr(param, "weight_loader", None)
+    owner = getattr(loader, "__self__", None)
+    tp_rank = int(getattr(owner, "tp_rank", 0) or 0)
+    input_dim = getattr(param, "input_dim", None)
+    output_dim = getattr(param, "output_dim", None)
+    if (
+        input_dim is not None
+        and loaded_weight.ndim > input_dim
+        and loaded_weight.shape[input_dim] != param.shape[input_dim]
+    ):
+        shard = param.shape[input_dim]
+        loaded_weight = loaded_weight.narrow(input_dim, tp_rank * shard, shard)
+    elif (
+        output_dim is not None
+        and loaded_weight.ndim > output_dim
+        and loaded_weight.shape[output_dim] != param.shape[output_dim]
+    ):
+        shard = param.shape[output_dim]
+        loaded_weight = loaded_weight.narrow(output_dim, tp_rank * shard, shard)
+    if not loaded_weight.is_contiguous():
+        loaded_weight = loaded_weight.contiguous()
+    return loaded_weight
+
+
+def _assign_parameter(root: nn.Module, name: str, tensor: Tensor, template: nn.Parameter) -> None:
+    """Replace ``name`` with ``tensor``, keeping vLLM sharding attributes."""
+    module_name, _, param_name = name.rpartition(".")
+    module = root.get_submodule(module_name) if module_name else root
+    new_param = nn.Parameter(tensor, requires_grad=False)
+    for attr in ("output_dim", "input_dim", "weight_loader", "is_sharded_weight", "packed_dim"):
+        if hasattr(template, attr):
+            setattr(new_param, attr, getattr(template, attr))
+    module._parameters[param_name] = new_param
+
+
+def _quantize_loaded_linears(model: nn.Module, device: torch.device) -> None:
+    """Run online FP8 (or any non-unquantized method) after the bf16 assign.
+
+    ``process_weights_after_loading`` is what ``diffusers_loader`` runs; the
+    custom DiT path never entered that loader, so quantized linears stayed
+    bf16. One linear is moved to CUDA at a time so a CPU-offload load does
+    not park the whole DiT on the GPU.
+    """
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    quant_device = torch.device("cuda") if torch.cuda.is_available() else device
+    for module in model.modules():
+        method = getattr(module, "quant_method", None)
+        if method is None or isinstance(method, UnquantizedLinearMethod):
+            continue
+        if not hasattr(method, "process_weights_after_loading"):
+            continue
+        if quant_device.type == "cuda":
+            module.to(quant_device)
+        method.process_weights_after_loading(module)
+        # The loader's layerwise finalize deletes the "already processed" flag
+        # and calls this again. A second amax on float8 weights crashes on CPU.
+        module.quant_method.process_weights_after_loading = lambda _layer: None
+        if device.type != quant_device.type:
+            for pname, param in list(module.named_parameters(recurse=False)):
+                if param.device.type != device.type:
+                    module._parameters[pname] = nn.Parameter(param.detach().to(device), requires_grad=False)
+
+
 def _load_transformer_from_bundle(
     transformer_dir: str,
     *,
     dtype: torch.dtype,
     device: torch.device,
+    quant_config: Any = None,
 ) -> Kandinsky6Transformer3DModel:
     """Fast path for the ~28B-parameter DiT.
 
-    ``ModelMixin.from_pretrained`` cannot use its meta-device fast-init here
-    (accelerate's ``register_empty_parameter`` does not know vLLM's
-    ``RowvLLMParameter``/``ColumnvLLMParameter`` signatures), and its
-    ``low_cpu_mem_usage=False`` fallback allocates + copies every tensor on
-    the CPU (~8 min for 56 GiB, disk read is <1 min). Instead:
-
-    1. build the module on CPU with weight init skipped (untouched virtual
-       allocation, so it costs nothing) — this also materialises the
-       non-persistent RoPE / timestep buffers that live outside the state dict;
-    2. read the safetensors shards directly onto ``device`` and hand the
-       tensors to the module with ``load_state_dict(assign=True)``.
+    Builds the module with weight init skipped, then assigns each
+    safetensors tensor through the parameter's tensor-parallel shard
+    (``weight_loader`` narrowing) instead of ``load_state_dict(assign=True)``,
+    which copies the full checkpoint onto the already-sharded parameter.
     """
     from diffusers.models.modeling_utils import no_init_weights
     from safetensors import safe_open
+    from vllm.model_executor.models.utils import is_pp_missing_parameter
 
     config = Kandinsky6Transformer3DModel.load_config(transformer_dir)
-    with torch.device("cpu"), no_init_weights():
-        transformer = Kandinsky6Transformer3DModel.from_config(config)
+    # ``quant_config`` is in ``ignore_for_config``, and ``from_config`` drops
+    # those keys, so the DiT would be built unquantized. Lift it for this call.
+    model_cls = Kandinsky6Transformer3DModel
+    ignored = list(model_cls.ignore_for_config)
+    model_cls.ignore_for_config = [key for key in ignored if key != "quant_config"]
+    try:
+        with torch.device("cpu"), no_init_weights():
+            transformer = model_cls.from_config(config, quant_config=quant_config)
+    finally:
+        model_cls.ignore_for_config = ignored
+    if quant_config is not None:
+        methods = {type(getattr(m, "quant_method", None)).__name__ for m in transformer.modules()}
+        print(f"[k6] DiT quant methods: {sorted(methods)}", flush=True)
 
-    state: dict[str, Tensor] = {}
+    params = dict(transformer.named_parameters())
+    seen: set[str] = set()
+    unexpected: list[str] = []
     for shard in _transformer_shard_files(transformer_dir):
-        with safe_open(shard, framework="pt", device=str(device)) as f:
-            for key in f.keys():
-                tensor = f.get_tensor(key)
-                if tensor.is_floating_point() and tensor.dtype != dtype:
-                    tensor = tensor.to(dtype)
-                state[key] = tensor
-    result = transformer.load_state_dict(state, strict=False, assign=True)
-    if result.missing_keys or result.unexpected_keys:
+        with safe_open(shard, framework="pt", device=str(device)) as handle:
+            for key in handle.keys():
+                if is_pp_missing_parameter(key, transformer):
+                    seen.add(key)
+                    continue
+                if key not in params:
+                    unexpected.append(key)
+                    continue
+                tensor = handle.get_tensor(key)
+                # Online FP8 quantizes bf16 on CUDA inside
+                # ``process_weights_after_loading``. Casting to float8 here
+                # makes that amax run on CPU, which has no float8 kernel.
+                target_dtype = torch.bfloat16 if quant_config is not None else dtype
+                if tensor.is_floating_point() and tensor.dtype != target_dtype:
+                    tensor = tensor.to(target_dtype)
+                tensor = _shard_loaded_weight(params[key], tensor)
+                if tuple(tensor.shape) != tuple(params[key].shape):
+                    raise RuntimeError(
+                        f"Kandinsky6 weight {key}: checkpoint shard {tuple(tensor.shape)} "
+                        f"!= parameter {tuple(params[key].shape)}"
+                    )
+                _assign_parameter(transformer, key, tensor, params[key])
+                seen.add(key)
+                del tensor
+    missing = [name for name in params if name not in seen]
+    if missing or unexpected:
         raise RuntimeError(
             "Kandinsky6Transformer3DModel checkpoint mismatch: "
-            f"{len(result.missing_keys)} missing (e.g. {result.missing_keys[:5]}), "
-            f"{len(result.unexpected_keys)} unexpected (e.g. {result.unexpected_keys[:5]})"
+            f"{len(missing)} missing (e.g. {missing[:5]}), "
+            f"{len(unexpected)} unexpected (e.g. {unexpected[:5]})"
         )
-    del state
-    # Buffers were built on CPU; parameters were assigned on ``device``.
+    if quant_config is not None:
+        _quantize_loaded_linears(transformer, device)
     for name, buf in transformer.named_buffers():
         if buf.device != device:
             module_name, _, buf_name = name.rpartition(".")
@@ -997,7 +1142,12 @@ class Kandinsky6TI2VAPipeline(
         load_device = torch.device("cpu") if offload_requested else self.device
 
         transformer_dir = os.path.join(model_root, "transformer")
-        transformer = _load_transformer_from_bundle(transformer_dir, dtype=dtype, device=load_device)
+        transformer = _load_transformer_from_bundle(
+            transformer_dir,
+            dtype=dtype,
+            device=load_device,
+            quant_config=getattr(od_config, "quantization_config", None),
+        )
 
         vae_dir = os.path.join(model_root, "vae")
         vae = AutoencoderKLHunyuanVideo.from_pretrained(vae_dir, torch_dtype=torch.float16).to(load_device).eval()
@@ -1333,7 +1483,8 @@ class Kandinsky6TI2VAPipeline(
 
         device = self.device
         dtype = getattr(self.transformer, "dtype", torch.bfloat16)
-        if not isinstance(dtype, torch.dtype):
+        if not isinstance(dtype, torch.dtype) or dtype.itemsize < 2:
+            # FP8 weights must not become the latent/activation dtype.
             dtype = torch.bfloat16
 
         raw_dit = self.transformer

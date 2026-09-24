@@ -425,10 +425,6 @@ _NO_CACHE_ACCELERATION = {
     "Pi0Pipeline",
     "Pi05Pipeline",
     "LingBotWorldCausalDMDPipeline",
-    # Kandinsky 6's v1 port has no cache_dit/tea_cache/MagCache hooks wired
-    # yet (deferred follow-up work); list it so a stray cache_backend
-    # override disables gracefully instead of erroring.
-    "Kandinsky6TI2VAPipeline",
 }
 
 

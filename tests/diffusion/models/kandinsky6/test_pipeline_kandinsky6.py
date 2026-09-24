@@ -39,7 +39,7 @@ def test_kandinsky6_pipeline_import_and_registry():
     )
     assert _DIFFUSION_POST_PROCESS_FUNCS["Kandinsky6TI2VAPipeline"] == "get_kandinsky6_post_process_func"
     assert _DIFFUSION_PRE_PROCESS_FUNCS["Kandinsky6TI2VAPipeline"] == "get_kandinsky6_pre_process_func"
-    assert "Kandinsky6TI2VAPipeline" in _NO_CACHE_ACCELERATION
+    assert "Kandinsky6TI2VAPipeline" not in _NO_CACHE_ACCELERATION
 
 
 def test_kandinsky6_component_discovery_declarations():

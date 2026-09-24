@@ -210,22 +210,41 @@ Notes on the numbers:
 - The post-process payload is a flat dict (`video`, `audio` as float32 in
   `[-1, 1]`, `audio_sample_rate=44100`, `fps`) so the serving muxer picks
   up the correct sample rate.
+- Acceleration that is wired:
+  - Tensor parallel: the DiT loader narrows full checkpoint tensors onto
+    each rank's `ColumnParallelLinear` / `RowParallelLinear` shard.
+  - CFG parallel (`--cfg-parallel-size 2`): rank 0 runs the conditional
+    DiT, rank 1 the unconditional one, then both all-gather video and
+    audio velocities.
+  - HSDP: `_hsdp_shard_conditions` covers the indexed transformer blocks.
+    Do not combine with tensor parallel.
+  - Sequence parallel: visual tokens (and their RoPE) are sharded;
+    Ulysses all-to-all runs inside visual self-attention, Ring uses the
+    PyTorch ring kernel. Text stays replicated. Audio queries gather the
+    full visual sequence.
+  - Pipeline parallel: `visual_transformer_blocks` are split with
+    `PPMissingLayer`. Embeddings stay on the first stage, output heads on
+    the last. Activations and the final velocity are sent between stages.
+  - VAE patch parallel: Hunyuan decode splits the latent width when
+    `vae_patch_parallel_size > 1` and tiling is on.
+  - MagCache / TeaCache / Cache-DiT are registered. MagCache reuses the
+    Pro `mag_ratios`. TeaCache coefficients are **uncalibrated** (copied
+    from Qwen-Image) so skips are not quality-neutral. Cache-DiT targets
+    `visual_transformer_blocks` only and falls back to the same step cache
+    if the fused `(video, audio)` block return is rejected.
+  - FP8: online quantization runs in the DiT loader via
+    `process_weights_after_loading` after the sharded assign.
+  - `attention_engine: auto` uses FlashAttention-3 when
+    `flash_attn_interface` imports.
 - Known limitations:
-  - No MagCache/NaviCache (cache-acceleration) support — listed in
-    `_NO_CACHE_ACCELERATION` in `vllm_omni/diffusion/registry.py` so a
-    `cache_backend` override degrades gracefully instead of erroring.
-  - NABLA sparse attention and the framework's pluggable attention-backend
-    registry (the FASTVIDEO_VSA-style integration point) are not wired up;
-    attention runs through the native dense/flash dispatch reused from the
-    portable core (SDPA when no flash library is installed).
-  - Tensor parallelism (`--tensor-parallel-size > 1`), CFG-parallel and
-    other distributed-execution strategies are not yet validated for this
-    model.
-  - Prompt expansion (Qwen self-rewrite), NF4-quantized Qwen, and the
-    super-resolution cascade from the `k6_video` CLI are not part of this
-    port.
-  - `_load_components` loads directly from the converted-checkpoint bundle
-    directory rather than vLLM-Omni's streamed-prefetch loader.
+  - NABLA sparse attention is not registered in the framework attention
+    backend. NaviCache is not wired.
+  - Prompt expansion, NF4 Qwen, and the super-resolution cascade are not
+    part of this port.
+  - Distributed layerwise offload still uses one process unless another
+    parallel axis sets `world_size > 1` (for example tensor parallel).
+  - `_load_components` loads the bundle directly rather than the
+    streamed-prefetch loader.
 
 ## Supported features
 
@@ -234,9 +253,16 @@ Notes on the numbers:
 | Text-to-video-and-audio | Supported (validated on H100) | — |
 | Image-to-video-and-audio | Supported (not yet validated on hardware) | — |
 | CPU offload (`--enable-cpu-offload`) | Supported (required on 80 GB) | — |
-| Layerwise offload (`--enable-layerwise-offload`) | Implemented, not validated | — |
-| Tensor parallelism | Implemented, not validated | — |
-| CFG parallelism | Not supported | — |
-| MagCache / NaviCache | Not supported | — |
-| Quantization | Not yet tested | [`docs/user_guide/diffusion/quantization.md`](../../docs/user_guide/diffusion/quantization.md) |
+| Layerwise offload (`--enable-layerwise-offload`) | Supported (about 36 GiB peak on the smoke geometry) | — |
+| Tensor parallelism | Wired (sharded DiT load) | — |
+| CFG parallelism | Wired (`--cfg-parallel-size 2`) | — |
+| Ulysses / Ring sequence parallel | Wired (visual tokens only) | — |
+| Pipeline parallelism | Wired (visual block split) | — |
+| HSDP | Wired (not with tensor parallel) | — |
+| VAE patch parallel | Wired (width-split decode) | — |
+| MagCache | Wired (Pro ratios, step reuse) | — |
+| TeaCache | Wired, coefficients uncalibrated | — |
+| Cache-DiT | Wired on `visual_transformer_blocks` | — |
+| FP8 | Wired (online quant; smoke peak about 46 GiB vs 75 GiB bf16) | [`docs/user_guide/diffusion/quantization.md`](../../docs/user_guide/diffusion/quantization.md) |
+| NaviCache | Not supported | — |
 | LoRA | Not supported | — |

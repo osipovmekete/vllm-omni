@@ -12,6 +12,7 @@ native diffusion models).
 
 from __future__ import annotations
 
+import contextvars
 import math
 from typing import Any
 
@@ -24,6 +25,33 @@ from torch.nn.attention.flex_attention import BlockMask
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
+
+# Set while visual blocks run so self-attention can apply Ulysses/Ring only
+# to the sequence-sharded visual stream (text self-attention stays local).
+_VISUAL_SP: contextvars.ContextVar[bool] = contextvars.ContextVar("k6_visual_sp", default=False)
+
+
+def _parallel_size(kind: str) -> int:
+    """World size / rank for a parallel axis. 1 (or rank 0) when unset."""
+    try:
+        from vllm_omni.diffusion.distributed import parallel_state as ps
+    except Exception:
+        return 0 if kind == "pp_rank" else 1
+    try:
+        if kind == "pp":
+            return int(ps.get_pipeline_parallel_world_size())
+        if kind == "pp_rank":
+            return int(ps.get_pipeline_parallel_rank())
+        if kind == "sp":
+            return int(ps.get_sequence_parallel_world_size())
+        if kind == "ulysses":
+            return int(ps.get_ulysses_parallel_world_size())
+        if kind == "ring":
+            return int(ps.get_ring_parallel_world_size())
+    except Exception:
+        return 0 if kind == "pp_rank" else 1
+    return 1
 
 
 def get_freqs(dim: int, max_period: float = 10000.0) -> Tensor:
@@ -551,6 +579,53 @@ class Kandinsky6FeedForward(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def _partition_visual_blocks(num_blocks: int, factory) -> tuple[int, int, nn.ModuleList]:
+    """Keep every rank's block index stable; non-local slots are ``PPMissingLayer``."""
+    from vllm.model_executor.models.utils import PPMissingLayer
+
+    world = _parallel_size("pp")
+    if world <= 1:
+        start, end = 0, num_blocks
+    else:
+        from vllm.distributed.utils import get_pp_indices
+
+        start, end = get_pp_indices(num_blocks, _parallel_size("pp_rank"), world)
+    blocks = [factory(i) if start <= i < end else PPMissingLayer() for i in range(num_blocks)]
+    return start, end, nn.ModuleList(blocks)
+
+
+def _maybe_sequence_parallel_qkv(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    *,
+    is_self_attention: bool,
+) -> tuple[Tensor, Tensor, Tensor, Any, Any]:
+    """Ulysses all-to-all (and optional Ring) for sharded visual self-attention.
+
+    Text self-attention is not sequence-sharded, so the all-to-all runs only
+    while ``_VISUAL_SP`` is set. Returns ``(q, k, v, ring_group, ulysses_group)``.
+    """
+    if not is_self_attention or not _VISUAL_SP.get() or query.dim() != 4:
+        return query, key, value, None, None
+    ulysses = _parallel_size("ulysses")
+    ring = _parallel_size("ring")
+    if ulysses <= 1 and ring <= 1:
+        return query, key, value, None, None
+    from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
+    from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
+
+    sp = get_sp_group()
+    ulysses_group = None
+    if ulysses > 1:
+        ulysses_group = sp.ulysses_group
+        query = SeqAllToAll4D.apply(ulysses_group, query, 2, 1, False)
+        key = SeqAllToAll4D.apply(ulysses_group, key, 2, 1, False)
+        value = SeqAllToAll4D.apply(ulysses_group, value, 2, 1, False)
+    ring_group = sp.ring_group if ring > 1 else None
+    return query, key, value, ring_group, ulysses_group
+
+
 class Kandinsky6Attention(nn.Module):
     """K6 attention — self-attention when ``encoder_hidden_states`` is
     omitted, cross-attention otherwise. Separate ``to_query``/``to_key``/
@@ -673,6 +748,10 @@ class Kandinsky6Attention(nn.Module):
                 key, value = key.unsqueeze(0), value.unsqueeze(0)
             strip_output_batch = False
 
+        query, key, value, ring_group, ulysses_group = _maybe_sequence_parallel_qkv(
+            query, key, value, is_self_attention=is_self_attention
+        )
+
         if sparse_params is not None:
             from torch.nn.attention.flex_attention import flex_attention
 
@@ -681,11 +760,20 @@ class Kandinsky6Attention(nn.Module):
             v_ = value.transpose(1, 2).contiguous()
             block_mask = nabla_block_mask(q_, k_, sparse_params["sta_mask"], thr=sparse_params["P"])
             out = flex_attention(q_, k_, v_, block_mask=block_mask).transpose(1, 2).contiguous()
+        elif ring_group is not None:
+            from vllm_omni.diffusion.attention.backends.ring_pytorch_attn import ring_pytorch_attn_func
+
+            out = ring_pytorch_attn_func(query, key, value, group=ring_group)
         else:
             args = {"q": query, "k": key, "v": value}
             if attn_mask is not None:
                 args["attn_mask"] = attn_mask
             out = self.attn.get_attention()(**args)
+
+        if ulysses_group is not None:
+            from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
+
+            out = SeqAllToAll4D.apply(ulysses_group, out, 1, 2, False)
 
         if strip_output_batch:
             out = out[0]
@@ -1084,16 +1172,25 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
                 vis_for_va = apply_scale_shift_norm(self.va_normalization, vis, va_scale, va_shift).type_as(vis)
                 aud_for_av = apply_scale_shift_norm(self.av_normalization, aud, av_scale, av_shift).type_as(aud)
 
-                # V->A and A->V attention
+                # V->A and A->V attention. Visual tokens may be sequence-sharded;
+                # audio queries need the full visual key/value sequence.
                 rq_v = vis_rope if self.ca_rope else None
                 rk_a = aud_rope if self.ca_rope else None
+                vis_kv = vis_pre_ca
+                vis_rope_kv = rq_v
+                if _parallel_size("sp") > 1 and vis_pre_ca is not None:
+                    from vllm_omni.diffusion.distributed.sp_sharding import sp_gather
+
+                    vis_kv = sp_gather(vis_pre_ca, dim=1)
+                    if vis_rope_kv is not None:
+                        vis_rope_kv = sp_gather(vis_rope, dim=0)
                 vis_from_aud = (
                     self.va_cross_attention(vis_for_va, encoder_hidden_states=aud_pre_ca, rope_q=rq_v, rope_kv=rk_a)
                     * (1 - fake_audio)
                     * (1 - fake_video)
                 )
                 aud_from_vis = (
-                    self.av_cross_attention(aud_for_av, encoder_hidden_states=vis_pre_ca, rope_q=rk_a, rope_kv=rq_v)
+                    self.av_cross_attention(aud_for_av, encoder_hidden_states=vis_kv, rope_q=rk_a, rope_kv=vis_rope_kv)
                     * (1 - fake_audio)
                     * (1 - fake_video)
                 )
@@ -1142,16 +1239,45 @@ class Kandinsky6Transformer3DModel(ModelMixin, ConfigMixin):
     only — no LoRA/attention-processor mixins, unlike the Diffusers port)
     give this class real ``from_pretrained``/``save_pretrained`` support so
     ``_load_components`` in the vLLM-Omni pipeline can load a checkpoint
-    bundle directly. This only loads correctly for tp_size=1 today: the
-    saved state dict has full (unsharded) weights, and ``from_pretrained``
-    loads them straight into whatever local shard each rank's parallel
-    linear layers expect, which is only identity when there's one rank. A
-    genuine multi-rank checkpoint loader (matching vLLM's own sharded
-    ``load_weights``/``default_weight_loader`` convention) is follow-up
-    work, not yet wired up.
+    bundle directly. Full checkpoint tensors are narrowed onto each rank's
+    ``ColumnParallelLinear`` / ``RowParallelLinear`` shard by
+    ``_shard_loaded_weight`` in the pipeline loader.
     """
 
     ignore_for_config = ["quant_config", "prefix"]
+
+    # MagCache must not treat text and visual ModuleLists as one residual chain.
+    _magcache_block_attrs = ("visual_transformer_blocks",)
+
+    @staticmethod
+    def _is_transformer_block(name: str, module: nn.Module) -> bool:
+        del module
+        leaf = name.rsplit(".", 1)[-1]
+        if not leaf.isdigit():
+            return False
+        return any(
+            part in name
+            for part in (
+                "visual_transformer_blocks",
+                "text_transformer_blocks",
+                "video_text_transformer_blocks",
+                "audio_text_transformer_blocks",
+            )
+        )
+
+    _hsdp_shard_conditions = [_is_transformer_block]
+
+    # Visual tokens are (1, N, D). RoPE after fractal flatten is (N, 1, C, 2, 2).
+    # Text and audio stay replicated; cross-modal KV is gathered in the fused block.
+    _sp_plan = {
+        "_sp_visual_shard": {
+            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+        },
+        "_sp_visual_rope": {
+            0: SequenceParallelInput(split_dim=0, expected_dims=5, split_output=True, auto_pad=True),
+        },
+        "_sp_visual_gather": SequenceParallelOutput(gather_dim=1, expected_dims=3),
+    }
 
     @register_to_config
     def __init__(
@@ -1247,20 +1373,20 @@ class Kandinsky6Transformer3DModel(ModelMixin, ConfigMixin):
                     for i in range(num_text_blocks)
                 ]
             )
-            self.visual_transformer_blocks = nn.ModuleList(
-                [
-                    Kandinsky6TransformerDecoderBlock(
-                        model_dim,
-                        time_dim,
-                        ff_dim,
-                        head_dim,
-                        attention_engine,
-                        text_token_padding,
-                        quant_config=quant_config,
-                        prefix=f"{prefix}.visual_transformer_blocks.{i}",
-                    )
-                    for i in range(num_visual_blocks)
-                ]
+            def _decoder_block(i: int) -> Kandinsky6TransformerDecoderBlock:
+                return Kandinsky6TransformerDecoderBlock(
+                    model_dim,
+                    time_dim,
+                    ff_dim,
+                    head_dim,
+                    attention_engine,
+                    text_token_padding,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.visual_transformer_blocks.{i}",
+                )
+
+            self._pp_block_start, self._pp_block_end, self.visual_transformer_blocks = _partition_visual_blocks(
+                num_visual_blocks, _decoder_block
             )
         else:
             # T2VA: dual (video / audio) text+time branches + fused blocks
@@ -1321,28 +1447,45 @@ class Kandinsky6Transformer3DModel(ModelMixin, ConfigMixin):
                     ),
                 )
 
-            self.visual_transformer_blocks = nn.ModuleList(
-                [
-                    Kandinsky6FusedTransformerDecoderBlock(
-                        model_dim,
-                        time_dim,
-                        ff_dim,
-                        head_dim,
-                        model_dim_a,
-                        time_dim_a,
-                        ff_dim_a,
-                        head_dim_a,
-                        attention_engine,
-                        text_token_padding,
-                        ca_rope=ca_rope,
-                        cross_gates=cross_gates,
-                        fix_modulation=fix_modulation,
-                        quant_config=quant_config,
-                        prefix=f"{prefix}.visual_transformer_blocks.{i}",
-                    )
-                    for i in range(num_visual_blocks)
-                ]
+            def _fused_block(i: int) -> Kandinsky6FusedTransformerDecoderBlock:
+                return Kandinsky6FusedTransformerDecoderBlock(
+                    model_dim,
+                    time_dim,
+                    ff_dim,
+                    head_dim,
+                    model_dim_a,
+                    time_dim_a,
+                    ff_dim_a,
+                    head_dim_a,
+                    attention_engine,
+                    text_token_padding,
+                    ca_rope=ca_rope,
+                    cross_gates=cross_gates,
+                    fix_modulation=fix_modulation,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.visual_transformer_blocks.{i}",
+                )
+
+            self._pp_block_start, self._pp_block_end, self.visual_transformer_blocks = _partition_visual_blocks(
+                num_visual_blocks, _fused_block
             )
+
+        from vllm.model_executor.models.utils import PPMissingLayer
+
+        # Embeddings live on the first PP stage, heads on the last. Text/time
+        # modules stay on every rank (they are small next to the visual stack).
+        if _parallel_size("pp") > 1 and _parallel_size("pp_rank") != 0:
+            self.visual_embeddings = PPMissingLayer()
+            if hasattr(self, "audio_embeddings"):
+                self.audio_embeddings = PPMissingLayer()
+        if _parallel_size("pp") > 1 and _parallel_size("pp_rank") != _parallel_size("pp") - 1:
+            self.out_layer = PPMissingLayer()
+            if hasattr(self, "audio_out_layer"):
+                self.audio_out_layer = PPMissingLayer()
+        self._sp_visual_shard = nn.Identity()
+        self._sp_visual_rope = nn.Identity()
+        self._sp_visual_gather = nn.Identity()
+        self._pp_final = None
 
     # ------------------------------------------------------------------
     # Stage helpers (shared by forward / MagCache) — unchanged from core.
@@ -1484,6 +1627,103 @@ class Kandinsky6Transformer3DModel(ModelMixin, ConfigMixin):
         aud_embed = self.audio_embeddings(x_audio).unsqueeze(0)
         return aud_embed, audio_rope
 
+    def _sp_enter(self, vis: Tensor | None, rope: Tensor | None) -> tuple[Tensor | None, Tensor | None]:
+        if vis is None or (_parallel_size("pp") > 1 and _parallel_size("pp_rank") != 0):
+            return vis, rope
+        vis = self._sp_visual_shard(vis)
+        if rope is not None:
+            rope = self._sp_visual_rope(rope)
+        return vis, rope
+
+    def _sp_exit(self, vis: Tensor | None) -> Tensor | None:
+        if vis is None:
+            return None
+        if _parallel_size("pp") > 1 and _parallel_size("pp_rank") != _parallel_size("pp") - 1:
+            return vis
+        return self._sp_visual_gather(vis)
+
+    def _pp_recv_hidden(
+        self,
+        vis: Tensor | None,
+        aud: Tensor | None,
+        vis_rope: Tensor | None = None,
+        aud_rope: Tensor | None = None,
+    ) -> tuple[Tensor | None, Tensor | None, Tensor | None, Tensor | None]:
+        pp = _parallel_size("pp")
+        rank = _parallel_size("pp_rank")
+        if pp <= 1 or rank == 0:
+            return vis, aud, vis_rope, aud_rope
+        from vllm_omni.diffusion.distributed.parallel_state import get_pp_group
+
+        payload = get_pp_group().recv_tensor_dict(src=rank - 1)
+        assert payload is not None
+        if payload.get("shape") is not None:
+            self._pp_vis_shape = payload["shape"]
+        return (
+            payload.get("vis"),
+            payload.get("aud"),
+            payload.get("vis_rope", vis_rope),
+            payload.get("aud_rope", aud_rope),
+        )
+
+    def _pp_send_hidden_or_wait(
+        self,
+        vis: Tensor | None,
+        aud: Tensor | None,
+        vis_rope: Tensor | None = None,
+        aud_rope: Tensor | None = None,
+    ):
+        """Non-last PP ranks forward hidden states and wait for the velocity."""
+        pp = _parallel_size("pp")
+        if pp <= 1:
+            return None
+        rank = _parallel_size("pp_rank")
+        if rank == pp - 1:
+            return None
+        from vllm_omni.diffusion.distributed.parallel_state import get_pp_group
+
+        group = get_pp_group()
+        group.send_tensor_dict(
+            {
+                "vis": vis,
+                "aud": aud,
+                "vis_rope": vis_rope,
+                "aud_rope": aud_rope,
+                "shape": getattr(self, "_pp_vis_shape", None),
+            },
+            dst=rank + 1,
+        )
+        final = group.recv_tensor_dict(src=pp - 1)
+        assert final is not None
+        if "pair" in final:
+            return final["video"], final["audio"]
+        return final["video"]
+
+    def _pp_publish(self, result: Tensor | tuple[Tensor, Tensor]):
+        pp = _parallel_size("pp")
+        if pp <= 1 or _parallel_size("pp_rank") != pp - 1:
+            return result
+        from vllm_omni.diffusion.distributed.parallel_state import get_pp_group
+
+        group = get_pp_group()
+        if isinstance(result, tuple):
+            payload = {"pair": True, "video": result[0], "audio": result[1]}
+        else:
+            payload = {"video": result}
+        for dst in range(pp - 1):
+            group.send_tensor_dict(payload, dst=dst)
+        return result
+
+    def _iter_local_visual_blocks(self):
+        start = getattr(self, "_pp_block_start", 0)
+        end = getattr(self, "_pp_block_end", len(self.visual_transformer_blocks))
+        for index, block in enumerate(self.visual_transformer_blocks):
+            if index < start or index >= end:
+                continue
+            if type(block).__name__ == "PPMissingLayer":
+                continue
+            yield block
+
     def _run_visual_blocks_single(
         self,
         vis_embed: Tensor | None,
@@ -1495,39 +1735,49 @@ class Kandinsky6Transformer3DModel(ModelMixin, ConfigMixin):
         sparse_params: dict | None,
         attn_mask: Tensor | None = None,
     ) -> tuple[Tensor | None, Tensor | None]:
-        for blk in self.visual_transformer_blocks:
-            if self.is_multimodal:
-                if vis_embed is not None and aud_embed is None:
-                    vis_embed, _ = blk(
-                        vis_embed,
-                        None,
-                        te,
-                        te,
-                        (tm, tm),
-                        vis_rope,
-                        None,
-                        sparse_params,
-                        attn_mask,
-                    )
-                elif aud_embed is not None and vis_embed is None:
-                    _, aud_embed = blk(
-                        None,
-                        aud_embed,
-                        te,
-                        te,
-                        (tm, tm),
-                        None,
-                        aud_rope,
-                        None,
-                        attn_mask,
-                    )
-                else:
-                    raise RuntimeError("single-modality fused path expects exactly one of video/audio")
-            else:
-                if vis_embed is not None:
+        self._pp_final = None
+        vis_embed, aud_embed, vis_rope, aud_rope = self._pp_recv_hidden(vis_embed, aud_embed, vis_rope, aud_rope)
+        vis_embed, vis_rope = self._sp_enter(vis_embed, vis_rope)
+        token = _VISUAL_SP.set(_parallel_size("sp") > 1 and vis_embed is not None)
+        try:
+            for blk in self._iter_local_visual_blocks():
+                if self.is_multimodal:
+                    if vis_embed is not None and aud_embed is None:
+                        vis_embed, _ = blk(
+                            vis_embed,
+                            None,
+                            te,
+                            te,
+                            (tm, tm),
+                            vis_rope,
+                            None,
+                            sparse_params,
+                            attn_mask,
+                        )
+                    elif aud_embed is not None and vis_embed is None:
+                        _, aud_embed = blk(
+                            None,
+                            aud_embed,
+                            te,
+                            te,
+                            (tm, tm),
+                            None,
+                            aud_rope,
+                            None,
+                            attn_mask,
+                        )
+                    else:
+                        raise RuntimeError("single-modality fused path expects exactly one of video/audio")
+                elif vis_embed is not None:
                     vis_embed = blk(vis_embed, te, tm, vis_rope, sparse_params, attn_mask)
                 else:
                     aud_embed = blk(aud_embed, te, tm, aud_rope, None, attn_mask)
+        finally:
+            _VISUAL_SP.reset(token)
+        early = self._pp_send_hidden_or_wait(vis_embed, aud_embed, vis_rope, aud_rope)
+        if early is not None:
+            self._pp_final = early
+            return None, None
         return vis_embed, aud_embed
 
     def _run_visual_blocks_fused(
@@ -1543,18 +1793,31 @@ class Kandinsky6Transformer3DModel(ModelMixin, ConfigMixin):
         sparse_params: dict | None,
         attn_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
-        for blk in self.visual_transformer_blocks:
-            vis_embed, aud_embed = blk(
-                vis_embed,
-                aud_embed,
-                video_te,
-                audio_te,
-                (video_tm, audio_tm),
-                vis_rope,
-                aud_rope,
-                sparse_params,
-                attn_mask,
-            )
+        self._pp_final = None
+        vis_embed, aud_embed, vis_rope, aud_rope = self._pp_recv_hidden(
+            vis_embed, aud_embed, vis_rope, aud_rope
+        )
+        vis_embed, vis_rope = self._sp_enter(vis_embed, vis_rope)
+        token = _VISUAL_SP.set(_parallel_size("sp") > 1)
+        try:
+            for blk in self._iter_local_visual_blocks():
+                vis_embed, aud_embed = blk(
+                    vis_embed,
+                    aud_embed,
+                    video_te,
+                    audio_te,
+                    (video_tm, audio_tm),
+                    vis_rope,
+                    aud_rope,
+                    sparse_params,
+                    attn_mask,
+                )
+        finally:
+            _VISUAL_SP.reset(token)
+        early = self._pp_send_hidden_or_wait(vis_embed, aud_embed, vis_rope, aud_rope)
+        if early is not None:
+            self._pp_final = early
+            return None, None  # type: ignore[return-value]
         return vis_embed, aud_embed
 
     def _project_video(
@@ -1565,11 +1828,14 @@ class Kandinsky6Transformer3DModel(ModelMixin, ConfigMixin):
         sparse_params: dict | None,
     ) -> Tensor:
         to_fractal = sparse_params["to_fractal"] if sparse_params else False
+        if vis_shape is None:
+            vis_shape = getattr(self, "_pp_vis_shape", None)
+        vis_embed = self._sp_exit(vis_embed)
         vis_embed = fractal_unflatten(vis_embed, vis_shape, block_mask=to_fractal)
-        return self.out_layer(vis_embed, tm)
+        return self._pp_publish(self.out_layer(vis_embed, tm))
 
     def _project_audio(self, aud_embed: Tensor, tm: Tensor) -> Tensor:
-        return self.audio_out_layer(aud_embed.squeeze(0), tm)
+        return self._pp_publish(self.audio_out_layer(aud_embed.squeeze(0), tm))
 
     def _project_fused(
         self,
@@ -1579,10 +1845,13 @@ class Kandinsky6Transformer3DModel(ModelMixin, ConfigMixin):
         video_tm: Tensor,
         audio_tm: Tensor,
     ) -> tuple[Tensor, Tensor]:
+        if vis_shape is None:
+            vis_shape = self._pp_vis_shape
+        vis_embed = self._sp_exit(vis_embed)
         vis_embed = fractal_unflatten(vis_embed, vis_shape)
         video_vel = self.out_layer(vis_embed, video_tm)
         audio_vel = self.audio_out_layer(aud_embed.squeeze(0), audio_tm)
-        return video_vel, audio_vel
+        return self._pp_publish((video_vel, audio_vel))
 
     # ------------------------------------------------------------------
     # Forward
@@ -1622,13 +1891,17 @@ class Kandinsky6Transformer3DModel(ModelMixin, ConfigMixin):
                 te, tm = self._encode_t2v(te_in, pe_in, t_in, rope_in, attn_mask)
 
             if x_video is not None:
-                vis_embed, vis_shape, vis_rope = self._embed_visual(
-                    x_video,
-                    visual_rope,
-                    sparse_params,
-                    apply_fractal=True,
-                    visual_token_type_ids=visual_token_type_ids,
-                )
+                if _parallel_size("pp") > 1 and _parallel_size("pp_rank") != 0:
+                    vis_embed, vis_shape, vis_rope = None, getattr(self, "_pp_vis_shape", None), visual_rope
+                else:
+                    vis_embed, vis_shape, vis_rope = self._embed_visual(
+                        x_video,
+                        visual_rope,
+                        sparse_params,
+                        apply_fractal=True,
+                        visual_token_type_ids=visual_token_type_ids,
+                    )
+                    self._pp_vis_shape = vis_shape
                 vis_embed, _ = self._run_visual_blocks_single(
                     vis_embed,
                     None,
@@ -1639,7 +1912,11 @@ class Kandinsky6Transformer3DModel(ModelMixin, ConfigMixin):
                     sparse_params,
                     attn_mask,
                 )
-                return self._project_video(vis_embed, vis_shape, tm, sparse_params)
+                if self._pp_final is not None:
+                    final = self._pp_final
+                    self._pp_final = None
+                    return final
+                return self._project_video(vis_embed, self._pp_vis_shape, tm, sparse_params)
 
             aud_embed, aud_rope = self._embed_audio(x_audio, audio_rope)
             _, aud_embed = self._run_visual_blocks_single(
@@ -1652,6 +1929,10 @@ class Kandinsky6Transformer3DModel(ModelMixin, ConfigMixin):
                 sparse_params,
                 attn_mask,
             )
+            if self._pp_final is not None:
+                final = self._pp_final
+                self._pp_final = None
+                return final
             return self._project_audio(aud_embed, tm)
 
         te_v, pe_v = (
@@ -1669,14 +1950,19 @@ class Kandinsky6Transformer3DModel(ModelMixin, ConfigMixin):
         video_te, video_tm = self._encode_text("video", te_v, pe_v, t_v, rope_v, attn_mask)
         audio_te, audio_tm = self._encode_text("audio", te_a, pe_a, t_a, rope_a, attn_mask)
 
-        vis_embed, vis_shape, vis_rope = self._embed_visual(
-            x_video,
-            visual_rope,
-            sparse_params,
-            apply_fractal=False,
-            visual_token_type_ids=visual_token_type_ids,
-        )
-        aud_embed, aud_rope = self._embed_audio(x_audio, audio_rope)
+        if _parallel_size("pp") > 1 and _parallel_size("pp_rank") != 0:
+            vis_embed, vis_shape, vis_rope = None, getattr(self, "_pp_vis_shape", None), visual_rope
+            aud_embed, aud_rope = None, audio_rope
+        else:
+            vis_embed, vis_shape, vis_rope = self._embed_visual(
+                x_video,
+                visual_rope,
+                sparse_params,
+                apply_fractal=False,
+                visual_token_type_ids=visual_token_type_ids,
+            )
+            self._pp_vis_shape = vis_shape
+            aud_embed, aud_rope = self._embed_audio(x_audio, audio_rope)
 
         vis_embed, aud_embed = self._run_visual_blocks_fused(
             vis_embed,
@@ -1690,10 +1976,14 @@ class Kandinsky6Transformer3DModel(ModelMixin, ConfigMixin):
             sparse_params,
             attn_mask,
         )
+        if self._pp_final is not None:
+            final = self._pp_final
+            self._pp_final = None
+            return final
         return self._project_fused(
             vis_embed,
             aud_embed,
-            vis_shape,
+            self._pp_vis_shape,
             video_tm,
             audio_tm,
         )
