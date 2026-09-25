@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from .modeling_kandinsky6 import Kandinsky6Transformer3DModel
+from .kandinsky6_transformer import Kandinsky6Transformer3DModel
 from .modeling_kandinsky6_audio import Kandinsky6AudioVAE
 from .modeling_kandinsky6_vae import AutoencoderKLHunyuanVideo
 from .pipeline_kandinsky6 import (

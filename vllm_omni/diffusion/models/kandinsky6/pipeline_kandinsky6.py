@@ -33,6 +33,7 @@ from transformers import (
     Qwen2_5_VLForConditionalGeneration,
 )
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.interface import SupportAudioOutput, SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
@@ -41,7 +42,7 @@ from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
-from .modeling_kandinsky6 import Kandinsky6Transformer3DModel
+from .kandinsky6_transformer import Kandinsky6Transformer3DModel
 from .modeling_kandinsky6_audio import Kandinsky6AudioVAE
 from .modeling_kandinsky6_vae import AutoencoderKLHunyuanVideo
 from .scheduling_kandinsky6 import KandinskyFlowMatchScheduler
@@ -476,6 +477,7 @@ def append_i2va_tail_condition(
 def denoise_loop(  # noqa: PLR0912, PLR0913, PLR0915
     bundle: LatentBundle,
     dit: nn.Module,
+    cfg_model: CFGParallelMixin,
     text_embeds: TextEmbeds,
     null_text_embeds: TextEmbeds | list[TextEmbeds | None],
     visual_rope: Tensor | None,
@@ -601,56 +603,31 @@ def denoise_loop(  # noqa: PLR0912, PLR0913, PLR0915
             vel_cond, vel_uncond = cache.last_cond, cache.last_uncond
         else:
             use_cfg = abs(guidance_weight - 1.0) > guidance_epsilon
-            cfg_world = 1
-            cfg_rank = 0
-            try:
-                from vllm_omni.diffusion.distributed.parallel_state import (
-                    get_cfg_group,
-                    get_classifier_free_guidance_rank,
-                    get_classifier_free_guidance_world_size,
-                    is_cfg_group_initialized,
-                )
-
-                if is_cfg_group_initialized():
-                    cfg_world = int(get_classifier_free_guidance_world_size())
-                    cfg_rank = int(get_classifier_free_guidance_rank())
-            except Exception:
-                cfg_world = 1
-            if cfg_world > 1 and use_cfg:
-                # Rank 0 runs the conditional DiT, rank 1 the unconditional one,
-                # then both ranks all-gather so apply_cfg sees both velocities.
-                cfg_group = get_cfg_group()
-                if cfg_rank == 0:
-                    with _cache_scope("cond"):
-                        local = _forward(
-                            text_embeds["text_embeds"],
-                            text_embeds["pooled_embed"],
-                            text_rope,
-                            attention_mask,
-                        )
-                else:
-                    with _cache_scope("uncond"):
-                        local = _forward(null_te, null_pe, null_rope, null_attention_mask)
-                if isinstance(local, tuple):
-                    gathered = [cfg_group.all_gather(part, separate_tensors=True) for part in local]
-                    vel_cond = tuple(parts[0] for parts in gathered)
-                    vel_uncond = tuple(parts[1] for parts in gathered)
-                else:
-                    gathered = cfg_group.all_gather(local, separate_tensors=True)
-                    vel_cond, vel_uncond = gathered[0], gathered[1]
-            else:
-                with _cache_scope("cond"):
-                    vel_cond = _forward(
-                        text_embeds["text_embeds"],
-                        text_embeds["pooled_embed"],
-                        text_rope,
-                        attention_mask,
-                    )
-                if use_cfg:
-                    with _cache_scope("uncond"):
-                        vel_uncond = _forward(null_te, null_pe, null_rope, null_attention_mask)
-                else:
-                    vel_uncond = vel_cond
+            guided = cfg_model.predict_noise_maybe_with_cfg(
+                do_true_cfg=use_cfg,
+                true_cfg_scale=guidance_weight,
+                positive_kwargs={
+                    "forward": _forward,
+                    "text_embeds": text_embeds["text_embeds"],
+                    "pooled": text_embeds["pooled_embed"],
+                    "rope": text_rope,
+                    "attn_mask": attention_mask,
+                    "cache_scope": _cache_scope("cond"),
+                },
+                negative_kwargs={
+                    "forward": _forward,
+                    "text_embeds": null_te,
+                    "pooled": null_pe,
+                    "rope": null_rope,
+                    "attn_mask": null_attention_mask,
+                    "cache_scope": _cache_scope("uncond"),
+                },
+                cfg_normalize=False,
+            )
+            # The mixin already applied CFG. Storing the guided velocity on
+            # both slots keeps a later apply_cfg call as the identity.
+            vel_cond = guided
+            vel_uncond = guided
             if cache is not None:
                 cache.store(vel_cond, vel_uncond)
 
@@ -872,17 +849,10 @@ def _load_transformer_from_bundle(
     from safetensors import safe_open
     from vllm.model_executor.models.utils import is_pp_missing_parameter
 
-    config = Kandinsky6Transformer3DModel.load_config(transformer_dir)
-    # ``quant_config`` is in ``ignore_for_config``, and ``from_config`` drops
-    # those keys, so the DiT would be built unquantized. Lift it for this call.
-    model_cls = Kandinsky6Transformer3DModel
-    ignored = list(model_cls.ignore_for_config)
-    model_cls.ignore_for_config = [key for key in ignored if key != "quant_config"]
-    try:
-        with torch.device("cpu"), no_init_weights():
-            transformer = model_cls.from_config(config, quant_config=quant_config)
-    finally:
-        model_cls.ignore_for_config = ignored
+    with open(os.path.join(transformer_dir, "config.json"), encoding="utf-8") as handle:
+        config = json.load(handle)
+    with torch.device("cpu"), no_init_weights():
+        transformer = Kandinsky6Transformer3DModel.from_diffusers_config(config, quant_config=quant_config)
     if quant_config is not None:
         methods = {type(getattr(m, "quant_method", None)).__name__ for m in transformer.modules()}
         print(f"[k6] DiT quant methods: {sorted(methods)}", flush=True)
@@ -985,6 +955,7 @@ def get_kandinsky6_pre_process_func(od_config: OmniDiffusionConfig):
 
 class Kandinsky6TI2VAPipeline(
     nn.Module,
+    CFGParallelMixin,
     ProgressBarMixin,
     DiffusionPipelineProfilerMixin,
     SupportsComponentDiscovery,
@@ -1367,6 +1338,20 @@ class Kandinsky6TI2VAPipeline(
     # Denoise
     # ------------------------------------------------------------------
 
+    def predict_noise(
+        self,
+        *,
+        forward,
+        text_embeds,
+        pooled,
+        rope,
+        attn_mask,
+        cache_scope,
+    ):
+        """One CFG branch. ``forward`` is the denoise loop's DiT call."""
+        with cache_scope:
+            return forward(text_embeds, pooled, rope, attn_mask)
+
     def diffuse(
         self,
         *,
@@ -1400,6 +1385,7 @@ class Kandinsky6TI2VAPipeline(
             return denoise_loop(
                 bundle=bundle,
                 dit=self.transformer,
+                cfg_model=self,
                 text_embeds=positive,
                 null_text_embeds=negative,
                 visual_rope=visual_rope,

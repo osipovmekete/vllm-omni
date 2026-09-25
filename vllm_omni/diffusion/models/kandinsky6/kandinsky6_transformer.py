@@ -17,14 +17,13 @@ import math
 from typing import Any
 
 import torch
-import torch.nn.functional as F
-from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.models.modeling_utils import ModelMixin
 from torch import Tensor, nn
 from torch.nn.attention.flex_attention import BlockMask
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 
 # Set while visual blocks run so self-attention can apply Ulysses/Ring only
@@ -107,81 +106,6 @@ def fractal_unflatten(x: Tensor, shape: tuple, block_mask: bool = False) -> Tens
         x = x.reshape(-1, ps * ps, x.shape[-1])
         return _local_merge(x, shape, (1, ps, ps), dim=0)
     return x.reshape(*shape, x.shape[-1])
-
-
-def _sdpa(q: Tensor, k: Tensor, v: Tensor, attn_mask=None) -> Tensor:
-    q = q.transpose(1, 2).contiguous()
-    k = k.transpose(1, 2).contiguous()
-    v = v.transpose(1, 2).contiguous()
-    return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask).transpose(1, 2).contiguous()
-
-
-try:
-    from flash_attn import flash_attn_func as _fa2  # type: ignore[import]
-except Exception:
-    _fa2 = None
-
-try:
-    from flash_attn_interface import flash_attn_func as _fa3  # type: ignore[import]
-except Exception:
-    _fa3 = None
-
-try:
-    import sageattention as _sage_mod  # type: ignore[import]
-
-    def _sage(q, k, v, **_):
-        return _sage_mod.sageattn(q, k, v, tensor_layout="NHD", is_causal=False)
-
-except Exception:
-    _sage = None
-
-
-def resolve_attention_engine(requested: str) -> str:
-    """Resolve config/CLI attention name to an installable engine.
-
-    ``flash_attention_3`` falls back to ``auto`` when FA3 is not installed;
-    other explicit engines stay as requested (``SelfAttentionEngine`` may raise).
-    """
-    if requested == "flash_attention_3" and _fa3 is None:
-        print("[attention] flash_attention_3 requested but not installed; falling back to auto")
-        return "auto"
-    return requested
-
-
-class SelfAttentionEngine:
-    """Selects the best available attention kernel at construction time."""
-
-    _ENGINES = ("flash_attention_3", "flash_attention_2", "sage", "sdpa", "auto")
-
-    def __init__(self, engine: str = "auto"):
-        assert engine in self._ENGINES, f"Unknown attention engine: {engine!r}"
-        engine = resolve_attention_engine(engine)
-
-        if engine == "flash_attention_3":
-            if _fa3 is None:
-                raise RuntimeError("flash_attention_3 requested but not installed.")
-            self._fn = _fa3
-        elif engine == "flash_attention_2":
-            if _fa2 is None:
-                raise RuntimeError("flash_attention_2 requested but not installed.")
-            self._fn = _fa2
-        elif engine == "sage":
-            if _sage is None:
-                raise RuntimeError("sageattention requested but not installed.")
-            self._fn = _sage
-        elif engine == "sdpa":
-            self._fn = _sdpa
-        else:  # auto — pick best available
-            self._fn = _sdpa
-            if _sage is not None:
-                self._fn = _sage
-            if _fa2 is not None:
-                self._fn = _fa2
-            if _fa3 is not None:
-                self._fn = _fa3
-
-    def get_attention(self):
-        return self._fn
 
 
 def fast_sta_nabla(
@@ -641,6 +565,9 @@ class Kandinsky6Attention(nn.Module):
         text_token_padding: bool = False,
         visual: bool = False,
         *,
+        sequence_parallel: bool = False,
+        role: str = "kandinsky6.text_self",
+        role_category: str = "self",
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
@@ -692,7 +619,20 @@ class Kandinsky6Attention(nn.Module):
         self.visual = visual
         self.attention_engine = engine
         self.text_token_padding = text_token_padding
-        self.attn = SelfAttentionEngine("sdpa" if text_token_padding else engine)
+        self.sequence_parallel = sequence_parallel
+        self.attn = Attention(
+            num_heads=self.num_heads,
+            head_size=self.head_dim,
+            causal=False,
+            softmax_scale=1.0 / (self.head_dim ** 0.5),
+            num_kv_heads=self.num_heads,
+            prefix=prefix,
+            role=role,
+            role_category=role_category,
+            scatter_idx=2,
+            gather_idx=1,
+            skip_sequence_parallel=not sequence_parallel,
+        )
 
     def forward(
         self,
@@ -748,11 +688,10 @@ class Kandinsky6Attention(nn.Module):
                 key, value = key.unsqueeze(0), value.unsqueeze(0)
             strip_output_batch = False
 
-        query, key, value, ring_group, ulysses_group = _maybe_sequence_parallel_qkv(
-            query, key, value, is_self_attention=is_self_attention
-        )
-
         if sparse_params is not None:
+            query, key, value, _ring_group, ulysses_group = _maybe_sequence_parallel_qkv(
+                query, key, value, is_self_attention=is_self_attention and self.sequence_parallel
+            )
             from torch.nn.attention.flex_attention import flex_attention
 
             q_ = query.transpose(1, 2).contiguous()
@@ -760,20 +699,13 @@ class Kandinsky6Attention(nn.Module):
             v_ = value.transpose(1, 2).contiguous()
             block_mask = nabla_block_mask(q_, k_, sparse_params["sta_mask"], thr=sparse_params["P"])
             out = flex_attention(q_, k_, v_, block_mask=block_mask).transpose(1, 2).contiguous()
-        elif ring_group is not None:
-            from vllm_omni.diffusion.attention.backends.ring_pytorch_attn import ring_pytorch_attn_func
+            if ulysses_group is not None:
+                from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
 
-            out = ring_pytorch_attn_func(query, key, value, group=ring_group)
+                out = SeqAllToAll4D.apply(ulysses_group, out, 1, 2, False)
         else:
-            args = {"q": query, "k": key, "v": value}
-            if attn_mask is not None:
-                args["attn_mask"] = attn_mask
-            out = self.attn.get_attention()(**args)
-
-        if ulysses_group is not None:
-            from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
-
-            out = SeqAllToAll4D.apply(ulysses_group, out, 1, 2, False)
+            metadata = AttentionMetadata(attn_mask=attn_mask) if attn_mask is not None else None
+            out = self.attn(query, key, value, metadata)
 
         if strip_output_batch:
             out = out[0]
@@ -900,6 +832,8 @@ class Kandinsky6TransformerEncoderBlock(nn.Module):
             head_dim,
             engine=engine,
             text_token_padding=text_token_padding,
+            role="kandinsky6.text_self",
+            role_category="self",
             quant_config=quant_config,
             prefix=f"{prefix}.self_attention" if prefix else "self_attention",
         )
@@ -938,6 +872,7 @@ class Kandinsky6TransformerDecoderBlock(nn.Module):
         engine: str = "auto",
         text_token_padding: bool = False,
         *,
+        self_sequence_parallel: bool = False,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
@@ -955,6 +890,9 @@ class Kandinsky6TransformerDecoderBlock(nn.Module):
             head_dim,
             engine=engine,
             visual=True,
+            sequence_parallel=self_sequence_parallel,
+            role="kandinsky6.visual_self" if self_sequence_parallel else "kandinsky6.audio_self",
+            role_category="self",
             quant_config=quant_config,
             prefix=f"{prefix}.self_attention" if prefix else "self_attention",
         )
@@ -965,6 +903,8 @@ class Kandinsky6TransformerDecoderBlock(nn.Module):
             kv_dim=model_dim,
             engine=engine,
             text_token_padding=text_token_padding,
+            role="kandinsky6.text_cross",
+            role_category="cross",
             quant_config=quant_config,
             prefix=f"{prefix}.cross_attention" if prefix else "cross_attention",
         )
@@ -1039,6 +979,7 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
             head_dim,
             engine,
             text_token_padding,
+            self_sequence_parallel=True,
             quant_config=quant_config,
             prefix=f"{prefix}.videoT" if prefix else "videoT",
         )
@@ -1049,6 +990,7 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
             head_dim_a,
             engine,
             text_token_padding,
+            self_sequence_parallel=False,
             quant_config=quant_config,
             prefix=f"{prefix}.audioT" if prefix else "audioT",
         )
@@ -1058,6 +1000,8 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
             head_dim,
             model_dim_a,
             engine,
+            role="kandinsky6.video_audio_cross",
+            role_category="cross",
             quant_config=quant_config,
             prefix=f"{prefix}.va_cross_attention" if prefix else "va_cross_attention",
         )
@@ -1066,6 +1010,8 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
             head_dim_a,
             model_dim,
             engine,
+            role="kandinsky6.audio_video_cross",
+            role_category="cross",
             quant_config=quant_config,
             prefix=f"{prefix}.av_cross_attention" if prefix else "av_cross_attention",
         )
@@ -1227,7 +1173,7 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class Kandinsky6Transformer3DModel(ModelMixin, ConfigMixin):
+class Kandinsky6Transformer3DModel(nn.Module):
     """Kandinsky 6 DiT — handles T2V (is_multimodal=False) and T2VA (is_multimodal=True).
 
     Tensor-parallel port of ``core/components/dit.py::DiffusionTransformer3D``,
@@ -1235,19 +1181,63 @@ class Kandinsky6Transformer3DModel(ModelMixin, ConfigMixin):
     layout (see module docstring) so ``from_pretrained`` loads a
     ``convert_checkpoint.py --use-patched-diffusers`` bundle directly.
 
-    ``ModelMixin``/``ConfigMixin`` (config.json + safetensors serialization
-    only — no LoRA/attention-processor mixins, unlike the Diffusers port)
-    give this class real ``from_pretrained``/``save_pretrained`` support so
-    ``_load_components`` in the vLLM-Omni pipeline can load a checkpoint
-    bundle directly. Full checkpoint tensors are narrowed onto each rank's
+    The class is a plain ``nn.Module``. ``from_diffusers_config`` reads the
+    bundle ``config.json`` and ``_load_transformer_from_bundle`` assigns
+    safetensors. Full checkpoint tensors are narrowed onto each rank's
     ``ColumnParallelLinear`` / ``RowParallelLinear`` shard by
     ``_shard_loaded_weight`` in the pipeline loader.
     """
 
-    ignore_for_config = ["quant_config", "prefix"]
+    _repeated_blocks = [
+        "Kandinsky6FusedTransformerDecoderBlock",
+        "Kandinsky6TransformerEncoderBlock",
+        "Kandinsky6TransformerDecoderBlock",
+    ]
 
     # MagCache must not treat text and visual ModuleLists as one residual chain.
     _magcache_block_attrs = ("visual_transformer_blocks",)
+
+    @classmethod
+    def from_diffusers_config(
+        cls,
+        config: dict,
+        *,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> "Kandinsky6Transformer3DModel":
+        """Build the DiT from a Diffusers ``config.json`` dict."""
+        fields = (
+            "in_visual_dim",
+            "out_visual_dim",
+            "in_text_dim",
+            "in_text_dim2",
+            "time_dim",
+            "patch_size",
+            "model_dim",
+            "ff_dim",
+            "num_text_blocks",
+            "num_visual_blocks",
+            "axes_dims",
+            "visual_cond",
+            "is_multimodal",
+            "in_audio_dim",
+            "model_dim_a",
+            "time_dim_a",
+            "ff_dim_a",
+            "axes_dims_a",
+            "audio_freqs_scaling",
+            "attention_engine",
+            "text_token_padding",
+            "ca_rope",
+            "cross_gates",
+            "fix_modulation",
+            "visual_token_type_num_embeddings",
+        )
+        kwargs = {key: config[key] for key in fields if key in config}
+        for key in ("patch_size", "axes_dims", "axes_dims_a"):
+            if isinstance(kwargs.get(key), list):
+                kwargs[key] = tuple(kwargs[key])
+        return cls(**kwargs, quant_config=quant_config, prefix=prefix)
 
     @staticmethod
     def _is_transformer_block(name: str, module: nn.Module) -> bool:
@@ -1279,7 +1269,6 @@ class Kandinsky6Transformer3DModel(ModelMixin, ConfigMixin):
         "_sp_visual_gather": SequenceParallelOutput(gather_dim=1, expected_dims=3),
     }
 
-    @register_to_config
     def __init__(
         self,
         in_visual_dim: int = 16,
@@ -1381,6 +1370,7 @@ class Kandinsky6Transformer3DModel(ModelMixin, ConfigMixin):
                     head_dim,
                     attention_engine,
                     text_token_padding,
+                    self_sequence_parallel=True,
                     quant_config=quant_config,
                     prefix=f"{prefix}.visual_transformer_blocks.{i}",
                 )

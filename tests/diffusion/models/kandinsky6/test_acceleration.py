@@ -7,7 +7,7 @@ import torch
 from torch import nn
 
 from vllm_omni.diffusion.models.kandinsky6.cache_accel import K6_PRO_MAG_RATIOS, K6StepCache
-from vllm_omni.diffusion.models.kandinsky6.modeling_kandinsky6 import Kandinsky6Transformer3DModel
+from vllm_omni.diffusion.models.kandinsky6.kandinsky6_transformer import Kandinsky6Transformer3DModel
 from vllm_omni.diffusion.models.kandinsky6.pipeline_kandinsky6 import _shard_loaded_weight
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 

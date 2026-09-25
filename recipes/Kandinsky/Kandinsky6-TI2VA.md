@@ -17,12 +17,11 @@
 
 Use this recipe to serve Kandinsky 6's TI2VA pipeline — a single DiT that
 jointly denoises video and audio latents, conditioned on a text prompt and,
-optionally, a reference image (image-to-video). This is a v1, correctness-
-first native integration: it ports Kandinsky 6's transformer, VAEs, and
-denoise loop onto vLLM-Omni's own tensor-parallel primitives and scheduler
-convention, but does not yet wire in MagCache/NaviCache acceleration, a
-registered NABLA sparse-attention backend, or CFG-parallel/distributed
-execution — see "Known limitations".
+optionally, a reference image (image-to-video). Tensor parallel, CFG
+parallel, Ulysses, ring, pipeline parallel, HSDP, layerwise offload,
+MagCache, TeaCache, Cache-DiT, FP8, and tiled VAE patch parallel are wired.
+NaviCache and a registered NABLA backend are not. TeaCache coefficients are
+uncalibrated. See "Known limitations".
 
 ## Supported model contract
 

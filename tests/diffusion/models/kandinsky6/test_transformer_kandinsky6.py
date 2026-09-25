@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -67,10 +68,21 @@ _TINY_T2VA_CONFIG = {
 }
 
 
+def _sdpa_config():
+    from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
+
+    return SimpleNamespace(
+        diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="TORCH_SDPA")),
+        parallel_config=SimpleNamespace(ring_degree=1, allgather_degree=1),
+    )
+
+
 def _build_transformer(config):
+    from vllm_omni.diffusion.config import set_current_diffusion_config
     from vllm_omni.diffusion.models.kandinsky6 import Kandinsky6Transformer3DModel
 
-    model = Kandinsky6Transformer3DModel(**config)
+    with set_current_diffusion_config(_sdpa_config()):
+        model = Kandinsky6Transformer3DModel(**config)
     model.eval()
     return model
 
@@ -231,11 +243,13 @@ def test_self_attention_attends_over_tokens_for_batched_and_unbatched_inputs(bat
     visual path handed SDPA a 5-D ``(1, 1, N, H, D)`` tensor, which it
     accepts silently but then treats the head axis as the sequence — every
     generated video decoded to pure noise."""
-    from vllm_omni.diffusion.models.kandinsky6.modeling_kandinsky6 import Kandinsky6Attention, apply_rotary
+    from vllm_omni.diffusion.config import set_current_diffusion_config
+    from vllm_omni.diffusion.models.kandinsky6.kandinsky6_transformer import Kandinsky6Attention, apply_rotary
 
     torch.manual_seed(0)
     channels, head_dim, tokens = 24, 12, 7
-    attn = Kandinsky6Attention(channels, head_dim, engine="sdpa").eval()
+    with set_current_diffusion_config(_sdpa_config()):
+        attn = Kandinsky6Attention(channels, head_dim, engine="sdpa").eval()
     with torch.no_grad():
         # vLLM parallel linears allocate with torch.empty (no init).
         for param in attn.parameters():
@@ -272,3 +286,40 @@ def test_modulation_projections_are_zero_initialized():
         assert torch.all(block.text_modulation.out_layer.weight == 0)
     for block in model.visual_transformer_blocks:
         assert torch.all(block.visual_modulation.out_layer.weight == 0)
+
+
+def test_dit_constructs_from_a_diffusers_config_dict():
+    from vllm_omni.diffusion.config import set_current_diffusion_config
+    from vllm_omni.diffusion.models.kandinsky6 import Kandinsky6Transformer3DModel
+
+    with set_current_diffusion_config(_sdpa_config()):
+        model = Kandinsky6Transformer3DModel.from_diffusers_config(
+            {**_TINY_T2VA_CONFIG, "patch_size": [1, 2, 2], "axes_dims": [4, 4, 4]}
+        )
+    assert tuple(model.patch_size) == (1, 2, 2)
+    assert model._repeated_blocks == [
+        "Kandinsky6FusedTransformerDecoderBlock",
+        "Kandinsky6TransformerEncoderBlock",
+        "Kandinsky6TransformerDecoderBlock",
+    ]
+    visual = model.visual_transformer_blocks[0].videoT.self_attention.attn
+    audio = model.visual_transformer_blocks[0].audioT.self_attention.attn
+    text = model.video_text_transformer_blocks[0].self_attention.attn
+    cross = model.visual_transformer_blocks[0].va_cross_attention.attn
+    assert visual.role == "kandinsky6.visual_self"
+    assert visual.skip_sequence_parallel is False
+    assert audio.skip_sequence_parallel is True
+    assert text.role == "kandinsky6.text_self"
+    assert text.skip_sequence_parallel is True
+    assert cross.role == "kandinsky6.video_audio_cross"
+    assert cross.skip_sequence_parallel is True
+
+
+def test_cfg_combine_matches_apply_cfg_without_normalization():
+    from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
+    from vllm_omni.diffusion.models.kandinsky6.pipeline_kandinsky6 import apply_cfg
+
+    positive = torch.tensor([1.0, 3.0])
+    negative = torch.tensor([0.25, -1.0])
+    combined = CFGParallelMixin.combine_cfg_noise(object(), positive, negative, 5.0, False)
+    torch.testing.assert_close(combined, apply_cfg(positive, negative, 5.0))
