@@ -983,7 +983,7 @@ class Kandinsky6TI2VAPipeline(
     _dit_modules = ["transformer"]
     _encoder_modules = ["text_encoder", "text_encoder_2"]
     _vae_modules = ["vae", "audio_vae"]
-    supports_step_execution = False
+    supports_step_execution = True
     support_audio_output = True
     support_image_input = True
     dummy_run_num_frames = 25
@@ -1412,6 +1412,297 @@ class Kandinsky6TI2VAPipeline(
 
     def __call__(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         return self.forward(req)
+
+    def _guided_velocity(self, state: Any) -> Tensor | tuple:
+        """One CFG-combined DiT velocity. Audio, when present, is the second element."""
+        extra = state.extra
+        step_index = int(state.step_index)
+        scheduler = state.scheduler
+        t = state.current_timestep
+        video = state.latents
+        audio = extra["audio"]
+        bundle = extra["bundle"]
+        dit = self.transformer
+        raw = _raw_dit(dit)
+        bs = int(extra["bs"])
+        guidance_weight = float(extra["guidance_scale"])
+        sample_audio = bool(extra["sample_audio"])
+        is_multimodal = video is not None and audio is not None
+        t_step: Tensor | list[Tensor] = t.unsqueeze(0).expand(bs)
+        model_input_v = (
+            _build_video_input(
+                video,
+                dit.visual_cond,
+                extra["first_frames"],
+                bundle.video_cu_seqlens,
+                extra["visual_cond_scheme"],
+            )
+            if video is not None
+            else None
+        )
+        if is_multimodal:
+            t_frozen = scheduler.sigmas[-1].unsqueeze(0).expand(bs) * 1000
+            if not sample_audio:
+                t_step = [t_step, t_frozen]
+            elif not extra["sample_video"]:
+                t_step = [t_frozen, t_step]
+
+        def _cache_scope(name: str):
+            cache_context = getattr(dit, "cache_context", None)
+            return cache_context(name) if callable(cache_context) else nullcontext()
+
+        def _forward(te, pe, rope, attn_mask, *, _model_input_v=model_input_v, _audio=audio, _t_step=t_step):
+            return dit(
+                x_video=_model_input_v,
+                x_audio=_audio,
+                text_embed=te,
+                pooled_text_embed=pe,
+                time=_t_step,
+                visual_rope=extra["visual_rope"],
+                audio_rope=extra["audio_rope"],
+                text_rope=rope,
+                sparse_params=extra["sparse_params"],
+                attention_mask=attn_mask,
+                visual_token_type_ids=extra["visual_token_type_ids"],
+            )
+
+        cache = getattr(raw, "_k6_step_cache", None)
+        if cache is not None and cache.should_skip(step_index):
+            return cache.last_cond
+        positive = extra["positive"]
+        guided = self.predict_noise_maybe_with_cfg(
+            do_true_cfg=bool(state.do_true_cfg),
+            true_cfg_scale=guidance_weight,
+            positive_kwargs={
+                "forward": _forward,
+                "text_embeds": positive["text_embeds"],
+                "pooled": positive["pooled_embed"],
+                "rope": extra["text_rope"],
+                "attn_mask": extra["positive_mask"],
+                "cache_scope": _cache_scope("cond"),
+            },
+            negative_kwargs={
+                "forward": _forward,
+                "text_embeds": extra["null_te"],
+                "pooled": extra["null_pe"],
+                "rope": extra["null_rope"],
+                "attn_mask": extra["negative_mask"],
+                "cache_scope": _cache_scope("uncond"),
+            },
+            cfg_normalize=False,
+        )
+        if cache is not None:
+            cache.store(guided, guided)
+        return guided
+
+    def prepare_encode(self, state: Any, **kwargs: Any) -> Any:
+        """Encode one request and store everything the denoise step needs."""
+        del kwargs
+        if state.prompt is None:
+            raise ValueError("Prompt is required for Kandinsky 6 generation.")
+        prompt_obj = state.prompt
+        prompt = prompt_obj if isinstance(prompt_obj, str) else (prompt_obj.get("prompt") or "")
+        negative_prompt = "" if isinstance(prompt_obj, str) else (prompt_obj.get("negative_prompt") or "")
+        image = None
+        if not isinstance(prompt_obj, str):
+            image = (prompt_obj.get("multi_modal_data") or {}).get("image")
+            if image is None:
+                image = prompt_obj.get("image")
+            if isinstance(image, (list, tuple)):
+                image = image[0] if image else None
+        sampling = state.sampling
+        _raw_dit(self.transformer).clear_text_proj_cache()
+        height = sampling.height or 512
+        width = sampling.width or 768
+        num_frames = sampling.num_frames or 121
+        num_inference_steps = sampling.num_inference_steps or self.default_num_inference_steps
+        guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else 5.0
+        extra_args = sampling.extra_args or {}
+        sample_audio = bool(extra_args.get("sample_audio", True))
+        visual_cond_scheme = extra_args.get("visual_cond_scheme") or ("tail_cond_first_frame" if image else "pretrain")
+        generator = sampling.generator
+        if generator is None and sampling.seed is not None:
+            generator = torch.Generator(device=self.device).manual_seed(sampling.seed)
+        seed = (
+            int(torch.randint(0, 2**31, (1,), generator=generator, device=generator.device).item())
+            if generator is not None
+            else int(torch.randint(0, 2**31, (1,)).item())
+        )
+        device = self.device
+        dtype = getattr(self.transformer, "dtype", torch.bfloat16)
+        if not isinstance(dtype, torch.dtype) or dtype.itemsize < 2:
+            dtype = torch.bfloat16
+        raw_dit = _raw_dit(self.transformer)
+        patch_size = tuple(int(v) for v in getattr(raw_dit, "patch_size", (1, 2, 2)))
+        first_frames = None
+        if image is not None:
+            first_frames, height, width = encode_i2va_first_frame(image, self.vae, device, height=height, width=width)
+        negative_prompt = negative_prompt or _DEFAULT_NEGATIVE_PROMPT
+        positive, positive_cu, positive_mask, negative, negative_cu, negative_mask = self._encode_prompt_pair(
+            prompt, negative_prompt
+        )
+        positive, positive_cu, positive_mask = self._move_text_embeds(
+            positive, positive_cu, positive_mask, device=device, dtype=dtype
+        )
+        negative, negative_cu, negative_mask = self._move_text_embeds(
+            negative, negative_cu, negative_mask, device=device, dtype=dtype
+        )
+        latent_frames = (num_frames - 1) // 4 + 1
+        bundle = self.prepare_latents(
+            latent_frames=latent_frames,
+            height=height,
+            width=width,
+            dtype=dtype,
+            device=device,
+            seed=seed,
+            sample_audio=sample_audio,
+        )
+        visual_token_type_ids = None
+        generated_visual_mask = None
+        if image is not None and visual_cond_scheme == "tail_cond_first_frame":
+            video, visual_token_type_ids, generated_visual_mask = append_i2va_tail_condition(
+                bundle.video, first_frames, batch_size=1, video_duration=latent_frames
+            )
+            bundle = LatentBundle(
+                video=video,
+                audio=bundle.audio,
+                video_cu_seqlens=torch.tensor([0, latent_frames + 1], dtype=torch.int32, device=device),
+                audio_cu_seqlens=bundle.audio_cu_seqlens,
+            )
+        visual_shape = (
+            latent_frames // patch_size[0],
+            (height // 8) // patch_size[1],
+            (width // 8) // patch_size[2],
+        )
+        visual_rope = compute_visual_rope(
+            raw_dit.visual_rope_embeddings, visual_shape, self.scale_factor, device=device
+        )
+        if generated_visual_mask is not None:
+            visual_rope = torch.cat([visual_rope, visual_rope[:1]], dim=0)
+        import copy
+
+        scheduler = copy.deepcopy(self.scheduler)
+        scheduler.set_timesteps(num_inference_steps, device=device)
+        text_rope, null_rope, audio_rope = self._text_ropes(
+            raw_dit,
+            text_length=int(positive_cu[-1].item()),
+            negative_text_length=int(negative_cu[-1].item()),
+            audio_length=int(bundle.audio_cu_seqlens[-1].item())
+            if bundle.audio is not None and bundle.audio_cu_seqlens is not None
+            else None,
+            device=device,
+        )
+        null_te, null_pe, null_rope = _resolve_null_embeds(negative, null_rope)
+        state.latents = bundle.video if bundle.video is not None else bundle.audio
+        state.timesteps = scheduler.timesteps
+        state.step_index = 0
+        state.scheduler = scheduler
+        state.do_true_cfg = abs(guidance_scale - 1.0) > 1e-6
+        state.extra = {
+            "bundle": bundle,
+            "audio": bundle.audio,
+            "positive": positive,
+            "positive_mask": positive_mask,
+            "negative_mask": negative_mask,
+            "null_te": null_te,
+            "null_pe": null_pe,
+            "null_rope": null_rope,
+            "text_rope": text_rope,
+            "visual_rope": visual_rope,
+            "audio_rope": audio_rope,
+            "sparse_params": None,
+            "first_frames": first_frames,
+            "visual_cond_scheme": visual_cond_scheme,
+            "visual_token_type_ids": visual_token_type_ids,
+            "generated_visual_mask": generated_visual_mask,
+            "sample_audio": sample_audio,
+            "sample_video": True,
+            "guidance_scale": guidance_scale,
+            "bs": 1,
+            "latent_frames": latent_frames,
+            "audio_normalization": str(extra_args.get("audio_normalization", "normalize")),
+            "audio_velocity": None,
+            "out_c": None,
+        }
+        return state
+
+    def denoise_step(self, input_batch: Any, **kwargs: Any) -> Tensor | None:
+        """One CFG-combined video velocity. Audio velocity is stashed on the request."""
+        del input_batch
+        states = kwargs.get("states") or ()
+        if len(states) != 1:
+            raise ValueError("Kandinsky 6 step execution supports one request at a time.")
+        state = states[0]
+        guided = self._guided_velocity(state)
+        if isinstance(guided, tuple):
+            video_velocity, audio_velocity = guided
+            state.extra["audio_velocity"] = audio_velocity
+            state.extra["out_c"] = int(video_velocity.shape[-1])
+            return video_velocity
+        state.extra["out_c"] = int(guided.shape[-1])
+        return guided
+
+    def step_scheduler(self, state: Any, noise_pred: Tensor | None, **kwargs: Any) -> None:
+        """Apply one scheduler update to video and, when present, audio."""
+        del kwargs
+        if noise_pred is None:
+            state.step_index += 1
+            return
+        extra = state.extra
+        scheduler = state.scheduler
+        t = state.current_timestep
+        step_index = int(state.step_index)
+        video = state.latents
+        scheme = extra["visual_cond_scheme"]
+        tail_cond = scheme == "tail_cond_first_frame"
+        bundle = extra["bundle"]
+        ref_positions = bundle.video_cu_seqlens[1:] - 1 if tail_cond and bundle.video_cu_seqlens is not None else None
+        first_frames = extra["first_frames"]
+        if extra["sample_video"] and video is not None and video.ndim >= 4:
+            video = scheduler.step(noise_pred, t, video, return_dict=False)[0]
+            if tail_cond and first_frames is not None and ref_positions is not None:
+                video[ref_positions] = first_frames.to(device=video.device, dtype=video.dtype)
+            state.latents = video
+        audio = extra["audio"]
+        audio_velocity = extra.get("audio_velocity")
+        if audio is not None and audio_velocity is not None and extra["sample_audio"]:
+            if not (video is not None and extra["sample_video"] and video.ndim >= 4):
+                extra["audio"] = scheduler.step(audio_velocity, t, audio, return_dict=False)[0]
+            else:
+                step_size = scheduler.sigmas[step_index + 1] - scheduler.sigmas[step_index]
+                extra["audio"] = audio + step_size.to(device=audio.device, dtype=audio.dtype) * audio_velocity
+        state.step_index += 1
+
+    def post_decode(self, state: Any, **kwargs: Any) -> DiffusionOutput:
+        """Decode the finished video and audio latents."""
+        del kwargs
+        extra = state.extra
+        video = state.latents
+        out_c = extra.get("out_c")
+        if out_c is not None and video is not None and video.ndim >= 4:
+            video = video[..., :out_c]
+        mask = extra.get("generated_visual_mask")
+        if mask is not None and video is not None:
+            video = video[mask]
+        device = video.device if video is not None else self.device
+        bundle = LatentBundle(
+            video=video,
+            audio=extra["audio"],
+            video_cu_seqlens=torch.tensor([0, extra["latent_frames"]], dtype=torch.int32, device=device),
+            audio_cu_seqlens=extra["bundle"].audio_cu_seqlens,
+        )
+        if state.sampling.output_type == "latent":
+            video_out: Tensor | np.ndarray = video.unsqueeze(0)
+        else:
+            decoded = postprocess_video(bundle, self.vae, bs=1)
+            video_out = decoded.permute(0, 2, 3, 4, 1).cpu().numpy()
+        audio_out = (
+            postprocess_audio(bundle, self.audio_vae, normalization_mode=extra["audio_normalization"])
+            if extra["sample_audio"]
+            else None
+        )
+        audio_sample_rate = self.audio_sample_rate if audio_out is not None else None
+        return DiffusionOutput(output={"video": video_out, "audio": audio_out, "audio_sample_rate": audio_sample_rate})
 
     @torch.no_grad()
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
