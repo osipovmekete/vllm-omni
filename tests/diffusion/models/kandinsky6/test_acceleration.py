@@ -3,6 +3,7 @@
 
 """CPU checks that Kandinsky 6 acceleration hooks are actually wired."""
 
+import pytest
 import torch
 from torch import nn
 
@@ -10,6 +11,8 @@ from vllm_omni.diffusion.models.kandinsky6.cache_accel import K6_PRO_MAG_RATIOS,
 from vllm_omni.diffusion.models.kandinsky6.kandinsky6_transformer import Kandinsky6Transformer3DModel
 from vllm_omni.diffusion.models.kandinsky6.pipeline_kandinsky6 import _shard_loaded_weight
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
 def test_shard_loaded_weight_narrows_column_parallel_output():

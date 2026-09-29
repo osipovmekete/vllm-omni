@@ -21,7 +21,7 @@ import os
 import shutil
 from os import PathLike
 from pathlib import Path
-from typing import Any, Dict, Literal, Optional, Union
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -30,14 +30,15 @@ import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from einops import rearrange
-from huggingface_hub import PyTorchModelHubMixin, hf_hub_download
-from vllm_omni.utils.audio import mel_filter_bank
-from torch import nn, pow, sin
+from huggingface_hub import PyTorchModelHubMixin
+from torch import pow, sin
 from torch.nn import Conv1d, ConvTranspose1d, Parameter
-from torch.nn import functional as F
 from torch.nn.utils import weight_norm as legacy_weight_norm
 from torch.nn.utils.parametrizations import weight_norm
 from torch.nn.utils.parametrize import remove_parametrizations
+
+from vllm_omni.transformers_utils.repo_utils import hf_api
+from vllm_omni.utils.audio import mel_filter_bank
 
 # Copyright (c) 2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
@@ -208,7 +209,7 @@ class DiagonalGaussianDistribution:
         if self.deterministic:
             self.var = self.std = torch.zeros_like(self.mean).to(device=self.parameters.device)
 
-    def sample(self, rng: Optional[torch.Generator] = None):
+    def sample(self, rng: torch.Generator | None = None):
         # x = self.mean + self.std * torch.randn(self.mean.shape).to(device=self.parameters.device)
 
         r = torch.empty_like(self.mean).normal_(generator=rng)
@@ -264,7 +265,6 @@ class ResnetBlock1D(nn.Module):
                 self.nin_shortcut = MPConv1D(in_dim, out_dim, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-
         # pixel norm
         if self.use_norm:
             x = normalize(x, dim=1)
@@ -336,7 +336,6 @@ class Downsample1D(nn.Module):
             self.conv2 = MPConv1D(in_channels, in_channels, kernel_size=1)
 
     def forward(self, x):
-
         if self.with_conv:
             x = self.conv1(x)
 
@@ -451,11 +450,10 @@ class VAE(nn.Module):
         self,
         x: torch.Tensor,
         sample_posterior: bool = True,
-        rng: Optional[torch.Generator] = None,
+        rng: torch.Generator | None = None,
         normalize: bool = True,
         unnormalize: bool = True,
     ) -> tuple[torch.Tensor, DiagonalGaussianDistribution]:
-
         posterior = self.encode(x, normalize=normalize)
         if sample_posterior:
             z = posterior.sample(rng)
@@ -541,7 +539,6 @@ class Encoder1D(nn.Module):
         self.learnable_gain = nn.Parameter(torch.zeros([]))
 
     def forward(self, x):
-
         # downsampling
         hs = [self.conv_in(x)]
         for i_level in range(self.num_layers):
@@ -1198,7 +1195,7 @@ class AMPBlock2(torch.nn.Module):
 
     def remove_weight_norm(self):
         for l in self.convs:
-            remove_weight_norm(l)
+            remove_parametrizations(l, "weight")
 
 
 TorchActivation1d = Activation1d
@@ -1363,10 +1360,10 @@ class BigVGANv2(
         revision: str,
         cache_dir: str,
         force_download: bool,
-        proxies: Optional[Dict],
+        proxies: dict | None,
         resume_download: bool,
         local_files_only: bool,
-        token: Union[str, bool, None],
+        token: str | bool | None,
         map_location: str = "cpu",  # Additional argument
         strict: bool = False,  # Additional argument
         use_cuda_kernel: bool = False,
@@ -1379,7 +1376,7 @@ class BigVGANv2(
             # print("Loading config.json from local directory")
             config_file = os.path.join(model_id, "config.json")
         else:
-            config_file = hf_hub_download(
+            config_file = hf_api().hf_hub_download(
                 repo_id=model_id,
                 filename="config.json",
                 revision=revision,
@@ -1395,13 +1392,13 @@ class BigVGANv2(
         # instantiate BigVGAN using h
         if use_cuda_kernel:
             print(
-                f"[WARNING] You have specified use_cuda_kernel=True during BigVGAN.from_pretrained(). Only inference is supported (training is not implemented)!"
+                "[WARNING] You have specified use_cuda_kernel=True during BigVGAN.from_pretrained(). Only inference is supported (training is not implemented)!"
             )
             print(
-                f"[WARNING] You need nvcc and ninja installed in your system that matches your PyTorch build is using to build the kernel. If not, the model will fail to initialize or generate incorrect waveform!"
+                "[WARNING] You need nvcc and ninja installed in your system that matches your PyTorch build is using to build the kernel. If not, the model will fail to initialize or generate incorrect waveform!"
             )
             print(
-                f"[WARNING] For detail, see the official GitHub repository: https://github.com/NVIDIA/BigVGAN?tab=readme-ov-file#using-custom-cuda-kernel-for-synthesis"
+                "[WARNING] For detail, see the official GitHub repository: https://github.com/NVIDIA/BigVGAN?tab=readme-ov-file#using-custom-cuda-kernel-for-synthesis"
             )
         model = cls(h, use_cuda_kernel=use_cuda_kernel)
 
@@ -1411,7 +1408,7 @@ class BigVGANv2(
             model_file = os.path.join(model_id, "bigvgan_generator.pt")
         else:
             print(f"Loading weights from {model_id}")
-            model_file = hf_hub_download(
+            model_file = hf_api().hf_hub_download(
                 repo_id=model_id,
                 filename="bigvgan_generator.pt",
                 revision=revision,
@@ -1429,7 +1426,7 @@ class BigVGANv2(
             model.load_state_dict(checkpoint_dict["generator"])
         except RuntimeError:
             print(
-                f"[INFO] the pretrained checkpoint does not contain weight norm. Loading the checkpoint after removing weight norm!"
+                "[INFO] the pretrained checkpoint does not contain weight norm. Loading the checkpoint after removing weight norm!"
             )
             model.remove_weight_norm()
             model.load_state_dict(checkpoint_dict["generator"])

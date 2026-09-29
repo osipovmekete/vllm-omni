@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-# SPDX-License-Identifier: Apache-2.0
 """Native K6 shifted flow-matching Euler scheduler.
 
 Self-contained (no ``diffusers`` dependency), matching the duck-typed

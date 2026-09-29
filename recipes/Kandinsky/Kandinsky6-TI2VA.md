@@ -4,8 +4,7 @@
 
 ## Summary
 
-- Vendor: not yet published on the Hub (weights supplied as a local raw
-  checkpoint tree; see "Building the checkpoint bundle")
+- Vendor: Kandinsky Lab ([`kandinskylab/Kandinsky-6.0-Pro-sft-5s-Diffusers`](https://huggingface.co/kandinskylab/Kandinsky-6.0-Pro-sft-5s-Diffusers))
 - Model: Kandinsky 6 Pro (TI2VA — text/image-to-video-and-audio)
 - Task: Joint text/image-to-video-and-audio generation
 - Mode: Offline (`Omni(...)`) and online serving with the OpenAI-compatible
@@ -27,7 +26,7 @@ uncalibrated. See "Known limitations".
 
 | Task | Entrypoint | Input | Output |
 |---|---|---|---|
-| Text-to-video-and-audio | `vllm serve <bundle> --omni` / `Omni(model=<bundle>)` | text prompt | synchronized MP4 (H.264 video + AAC 44.1 kHz mono audio) |
+| Text-to-video-and-audio | `vllm serve kandinskylab/Kandinsky-6.0-Pro-sft-5s-Diffusers --omni` / `Omni(model="kandinskylab/Kandinsky-6.0-Pro-sft-5s-Diffusers")` | text prompt | synchronized MP4 (H.264 video + AAC 44.1 kHz mono audio) |
 | Image-to-video-and-audio | same | text prompt + reference image | synchronized MP4, first frame conditioned on the reference image |
 
 - Audio generation is on by default (`sample_audio=True`); pass
@@ -51,9 +50,10 @@ uncalibrated. See "Known limitations".
   port-generation repo — `src/kandinsky/ports/templates/vllm/` and
   `src/kandinsky/ports/overrides/vllm/`); the Pro DiT config comes from
   `src/kandinsky/configs/k6_pro_125_480_864_mCache_mOffload.yaml`.
+- Hub checkpoint: [`kandinskylab/Kandinsky-6.0-Pro-sft-5s-Diffusers`](https://huggingface.co/kandinskylab/Kandinsky-6.0-Pro-sft-5s-Diffusers)
 - Joint video+audio native-model reference: [`recipes/MiniMaxAI/MiniMax-H3.md`](../MiniMaxAI/MiniMax-H3.md)
-- Bundle builder: [`tools/kandinsky6/build_bundle.py`](../../tools/kandinsky6/build_bundle.py)
-- Offline example: [`examples/offline_inference/text_to_video/kandinsky6_t2va.py`](../../examples/offline_inference/text_to_video/kandinsky6_t2va.py)
+- Offline example: [`examples/offline_inference/text_to_video/text_to_video.py`](../../examples/offline_inference/text_to_video/text_to_video.py)
+- Image-to-video example: [`examples/offline_inference/image_to_video/image_to_video.py`](../../examples/offline_inference/image_to_video/image_to_video.py)
 
 ## Hardware
 
@@ -78,56 +78,30 @@ uncalibrated. See "Known limitations".
 - vLLM version: 0.29.0
 - vLLM-Omni version or commit: this repository, `vllm_omni/diffusion/models/kandinsky6/`
 - diffusers 0.40.0, transformers 5.14.1
-- Attention: no `flash_attn_interface` / `flash_attn` / `sageattention`
-  installed → the DiT's `attention_engine: "auto"` falls back to PyTorch
-  SDPA. All timings below are SDPA timings; FA3 is expected to be
-  substantially faster (the `k6_video` reference uses it) but has not been
-  measured through this port.
+- Attention: FlashAttention-3 on this box (`flash_attn_interface`). The Pro
+  timings below use it. Without FA3, `attention_engine: "auto"` falls back
+  to PyTorch SDPA; an earlier SDPA Pro run on the same GPU was 26.9 s/it
+  and 1377 s.
 
-## Building the checkpoint bundle
+## Weights
 
-`Kandinsky6TI2VAPipeline._load_components` expects a Diffusers-style bundle
-directory (`model_index.json`, `transformer/`, `vae/`, `text_encoder/`,
-`tokenizer/`, `text_encoder_2/`, `tokenizer_2/`, `audio_vae/`,
-`scheduler/`). Build it once from the raw Kandinsky 6 weight tree:
+`Kandinsky6TI2VAPipeline._load_components` loads the public Diffusers layout
+from [`kandinskylab/Kandinsky-6.0-Pro-sft-5s-Diffusers`](https://huggingface.co/kandinskylab/Kandinsky-6.0-Pro-sft-5s-Diffusers)
+(`model_index.json`, `transformer/`, `vae/`, `text_encoder/`, `tokenizer/`,
+`text_encoder_2/`, `tokenizer_2/`, `audio_vae/`, `scheduler/`). Pass that
+repo id (or a local snapshot of it) to `vllm serve` / `Omni(model=...)`.
+The Hub repo is gated; export `HF_TOKEN` if download returns 401.
 
-```bash
-# Raw tree layout expected under --weights-root:
-#   <dit>.safetensors            single-file DiT (mixed F32/BF16, ~70 GB)
-#   vae/                         diffusers-format HunyuanVideo VAE
-#   text_encoder/                Qwen2.5-VL-7B HF repo (model + processor/tokenizer)
-#   text_encoder2/               CLIP text encoder HF repo
-#   tod_vae/ext_weights/v1-44.pth
-#   bigvgan_vocoder/             config.json + bigvgan_generator.pt
-python tools/kandinsky6/build_bundle.py \
-  --weights-root /path/to/weights_k6 \
-  --dit-file <dit>.safetensors \
-  --out /path/to/weights_k6/vllm_omni_bundle
-```
+A raw Kandinsky 6 weight tree is not required. If you already have a local
+Diffusers-layout snapshot, point `--model` at that directory instead of the
+Hub id.
 
-What it does:
-
-- `transformer/`: streams the raw safetensors, applies the two key renames
-  (`visual_blocks.N.` → `visual_transformer_blocks.N.`,
-  `audio_outLayer.` → `audio_out_layer.`), casts F32 → bf16, and writes
-  ~57 GB of sharded `diffusion_pytorch_model-*.safetensors` + index next to
-  a `config.json` holding the Pro `dit:` block (`attention_engine: "auto"`,
-  `text_token_padding: false`). Pass `--verify` to check the re-keyed names
-  against the module tree (zero missing/unexpected keys expected).
-- `vae/`, `text_encoder/`, `tokenizer/`, `text_encoder_2/`, `tokenizer_2/`:
-  symlinks to the raw component dirs (`--copy` to materialize).
-- `audio_vae/`: `Kandinsky6AudioVAE` (MMAudio TOD VAE + BigVGAN-v2,
-  `scaling_factor=0.5302`) saved via `save_pretrained`, so the bundle loads
-  without the original `.pth`/`.pt` paths.
-- `scheduler/scheduler_config.json`: `{"shift": 5.0}`.
-
-The DiT loads with meta-device init + `load_state_dict(assign=True)`; the
-full bundle loads in ~27 s from a warm page cache.
+The DiT loads with meta-device init + `load_state_dict(assign=True)`.
 
 ## Command
 
 ```bash
-vllm serve /path/to/weights_k6/vllm_omni_bundle --omni \
+vllm serve kandinskylab/Kandinsky-6.0-Pro-sft-5s-Diffusers --omni \
   --host 127.0.0.1 --port 8091 \
   --num-gpus 1 --enable-cpu-offload
 ```
@@ -140,16 +114,25 @@ the VAEs and activations do not fit an 80 GB device at the Pro geometry.
 Offline (writes an MP4 with the audio track muxed in):
 
 ```bash
-python examples/offline_inference/text_to_video/kandinsky6_t2va.py \
-  --model /path/to/weights_k6/vllm_omni_bundle \
+python examples/offline_inference/text_to_video/text_to_video.py \
+  --model kandinskylab/Kandinsky-6.0-Pro-sft-5s-Diffusers \
   --prompt "A golden retriever runs along a sunny beach, waves crashing, cinematic footage" \
   --seed 42 --enable-cpu-offload --output kandinsky6_t2va.mp4
-# Image-to-video-and-audio: add --image first_frame.png
-# Video only:               add --no-audio
+# Video only: add --extra-body '{"sample_audio": false}'
 ```
 
-The generic `examples/offline_inference/text_to_video/text_to_video.py`
-also works with the bundle path and picks up the same Pro defaults.
+Image-to-video-and-audio uses the shared image-to-video example:
+
+```bash
+python examples/offline_inference/image_to_video/image_to_video.py \
+  --model kandinskylab/Kandinsky-6.0-Pro-sft-5s-Diffusers \
+  --image first_frame.png \
+  --prompt "A golden retriever runs along a sunny beach, waves crashing, cinematic footage" \
+  --seed 42 --enable-cpu-offload --output kandinsky6_i2va.mp4
+```
+
+The generic scripts pick up the Pro defaults from
+`vllm_omni/model_extras/kandinsky6.py`.
 
 ## Verification
 
@@ -175,30 +158,40 @@ Smoke-size request for quick validation (~30 s end-to-end on one H100):
 
 ## Measurements
 
-Single H100 80GB, `--enable-cpu-offload`, SDPA attention, seed 42, same
-prompt as above. `text_to_video.py` / `vllm serve` figures:
+Single H100 80GB, seed 42, prompt
+"A golden retriever runs along a sunny beach, waves crashing, cinematic footage",
+negative prompt left at the pipeline default, MagCache off, prompt expansion
+off. Pro geometry: 864x480, 125 frames, 50 steps, CFG 5.0, audio on.
 
-| Geometry | Steps | DiT step time | Total generation | Peak GPU (reserved) | GPU after load |
-|---|---|---|---|---|---|
-| 864x480, 125 frames (Pro default) | 50 | 26.9 s/it | 1377 s (22.9 min) | 74.97 GiB | 17.7 GiB |
-| 512x320, 25 frames (smoke) | 10 | 1.4 s/it | 29.5 s | 74.97 GiB | 17.7 GiB |
+vLLM-Omni: `text_to_video.py --enable-cpu-offload --model-class-name Kandinsky6TI2VAPipeline`,
+FlashAttention-3. Native: `kandy generate` from `k6_video` with
+`k6_pro_125_480_864_mCache_mOffload.yaml`, `--no-magcache --expand-prompts 0
+--offload module`, FlashAttention-3.
 
-Notes on the numbers:
+| Stack | Wall / generation | Step time | Peak GPU | After load |
+|---|---|---|---|---|
+| vLLM-Omni | 751.7 s generation (12.5 min); engine init 41 s | 14.4 s/it average | 78.39 GiB reserved (78.0 GiB nvidia-smi) | 17.74 GiB |
+| Native `k6_video` | 959 s process (16.0 min), including weight load | not logged | 66.3 GiB nvidia-smi | — |
 
-- Peak reserved memory is dominated by the resident bf16 DiT (~56 GB) plus
-  SDPA attention workspace for ~50k visual tokens at the Pro geometry.
-- Step time is the CFG pair (conditional + unconditional DiT forward) at
-  SDPA; no cache acceleration is applied.
-- Output was sanity-checked against the `k6_video` production CLI
-  (`kandy generate`, same prompt and seed, MagCache and prompt expansion
-  off, FA3 + module offload, ~18 min): both produce a coherent golden
-  retriever running along a beach with breaking waves across all 125
-  frames, with an audible synchronized track of identical length (5.22 s).
-  Bit-exact parity is not expected (different noise plumbing), so the
-  scenes differ in composition.
-- Audio is peak-normalized to full scale by default, as in the production
-  pipeline; pass `extra_args.audio_normalization="clip"` to keep the raw
-  decoded amplitude instead.
+An earlier SDPA vLLM-Omni Pro run on the same GPU was 26.9 s/it and 1377 s,
+peak reserved 74.97 GiB. A 512x320 / 25-frame / 10-step SDPA smoke was 1.4 s/it
+and 29.5 s at the same reserved peak.
+
+Both MP4s are H.264 864x480, 125 frames at 24 fps (5.22 s), plus AAC 44.1 kHz
+mono (230400 samples). Pixel PSNR between them is 8.5 dB (mean absolute
+difference 77/255). Audio sample correlation is about 0. Both show a golden
+retriever on a sunny beach with breaking waves for the full clip; the shots
+are different (wide beach, then the dog running, then the dog beside a rock
+on the native side; a close dog, then the dog on the shoreline, then the dog
+running into the surf on the vLLM-Omni side). Same seed does not produce the
+same noise, so bit-exact parity is not expected.
+
+vLLM-Omni's VAE decode logged two failed CUDA allocations (7.15 GiB, then
+4.27 GiB) and still wrote a complete file.
+
+Audio is peak-normalized to full scale by default, as in the production
+pipeline; pass `extra_args.audio_normalization="clip"` to keep the raw
+decoded amplitude instead.
 
 ## Notes
 
@@ -242,7 +235,7 @@ Notes on the numbers:
     part of this port.
   - Distributed layerwise offload still uses one process unless another
     parallel axis sets `world_size > 1` (for example tensor parallel).
-  - `_load_components` loads the bundle directly rather than the
+  - `_load_components` loads the Diffusers checkpoint directly rather than the
     streamed-prefetch loader.
 
 ## Supported features

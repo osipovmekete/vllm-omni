@@ -22,6 +22,7 @@ from torch.nn.attention.flex_attention import BlockMask
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
@@ -624,7 +625,7 @@ class Kandinsky6Attention(nn.Module):
             num_heads=self.num_heads,
             head_size=self.head_dim,
             causal=False,
-            softmax_scale=1.0 / (self.head_dim ** 0.5),
+            softmax_scale=1.0 / (self.head_dim**0.5),
             num_kv_heads=self.num_heads,
             prefix=prefix,
             role=role,
@@ -1204,7 +1205,7 @@ class Kandinsky6Transformer3DModel(nn.Module):
         *,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-    ) -> "Kandinsky6Transformer3DModel":
+    ) -> Kandinsky6Transformer3DModel:
         """Build the DiT from a Diffusers ``config.json`` dict."""
         fields = (
             "in_visual_dim",
@@ -1362,6 +1363,7 @@ class Kandinsky6Transformer3DModel(nn.Module):
                     for i in range(num_text_blocks)
                 ]
             )
+
             def _decoder_block(i: int) -> Kandinsky6TransformerDecoderBlock:
                 return Kandinsky6TransformerDecoderBlock(
                     model_dim,
@@ -1784,9 +1786,7 @@ class Kandinsky6Transformer3DModel(nn.Module):
         attn_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         self._pp_final = None
-        vis_embed, aud_embed, vis_rope, aud_rope = self._pp_recv_hidden(
-            vis_embed, aud_embed, vis_rope, aud_rope
-        )
+        vis_embed, aud_embed, vis_rope, aud_rope = self._pp_recv_hidden(vis_embed, aud_embed, vis_rope, aud_rope)
         vis_embed, vis_rope = self._sp_enter(vis_embed, vis_rope)
         token = _VISUAL_SP.set(_parallel_size("sp") > 1)
         try:

@@ -12,14 +12,43 @@ from pathlib import Path
 import pytest
 
 from tests.helpers.mark import hardware_marks
-from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient
+from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient, get_model_prefix
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 _HUB_MODEL = "kandinskylab/Kandinsky-6.0-Pro-sft-5s-Diffusers"
 _LOCAL_BUNDLE = Path(__file__).resolve().parents[4] / "kandinsky6_bundle"
-MODEL = os.environ.get("KANDINSKY6_MODEL", str(_LOCAL_BUNDLE) if _LOCAL_BUNDLE.is_dir() else _HUB_MODEL)
+
+
+def _resolve_model() -> str:
+    env = os.environ.get("KANDINSKY6_MODEL")
+    if env:
+        return env
+    if _LOCAL_BUNDLE.is_dir():
+        return str(_LOCAL_BUNDLE)
+    return _HUB_MODEL
+
+
+def _checkpoint_on_disk(model: str) -> bool:
+    if Path(model).is_dir():
+        return True
+    prefix = get_model_prefix()
+    return bool(prefix) and Path(prefix + model).is_dir()
+
+
+MODEL = _resolve_model()
 PROMPT = "A golden retriever runs along a sunny beach, waves crashing."
+
+pytestmark = [
+    pytest.mark.skipif(
+        not _checkpoint_on_disk(MODEL),
+        reason=(
+            "Kandinsky 6 Diffusers weights are gated. Set KANDINSKY6_MODEL or "
+            "MODEL_PREFIX to a local copy of "
+            "kandinskylab/Kandinsky-6.0-Pro-sft-5s-Diffusers."
+        ),
+    ),
+]
 
 SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
 

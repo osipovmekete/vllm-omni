@@ -48,7 +48,7 @@ def test_kandinsky6_component_discovery_declarations():
     assert Kandinsky6TI2VAPipeline._dit_modules == ["transformer"]
     assert Kandinsky6TI2VAPipeline._encoder_modules == ["text_encoder", "text_encoder_2"]
     assert Kandinsky6TI2VAPipeline._vae_modules == ["vae", "audio_vae"]
-    assert Kandinsky6TI2VAPipeline.supports_step_execution is False
+    assert Kandinsky6TI2VAPipeline.supports_step_execution is True
     assert Kandinsky6TI2VAPipeline.support_audio_output is True
     assert Kandinsky6TI2VAPipeline.support_image_input is True
 

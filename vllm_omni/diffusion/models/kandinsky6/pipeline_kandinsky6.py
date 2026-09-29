@@ -32,6 +32,7 @@ from transformers import (
     CLIPTokenizer,
     Qwen2_5_VLForConditionalGeneration,
 )
+
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -902,6 +903,65 @@ def _load_transformer_from_bundle(
     return transformer.eval()
 
 
+def _resolve_bundle_root(model: str) -> str:
+    """Return a local Diffusers bundle directory for a path or Hub repo id."""
+    if os.path.isdir(model):
+        return model
+    from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+
+    return download_weights_from_hf_specific(
+        model_name_or_path=model,
+        cache_dir=None,
+        allow_patterns=["*"],
+        require_all=True,
+    )
+
+
+def _load_audio_vae(audio_vae_dir: str, *, dtype: torch.dtype, device: torch.device) -> nn.Module:
+    """Load ``audio_vae/`` from a Diffusers bundle.
+
+    Official Hub checkpoints store ``FeaturesUtils`` keys at the root
+    (``vae.*`` / ``vocoder.*``, or older ``tod.vae.*``). ``Kandinsky6AudioVAE``
+    nests that module as ``native.tod``.
+    """
+    weight_path = os.path.join(audio_vae_dir, "diffusion_pytorch_model.safetensors")
+    if not os.path.isfile(weight_path):
+        return Kandinsky6AudioVAE.from_pretrained(audio_vae_dir, torch_dtype=dtype).to(device).eval()
+
+    with open(os.path.join(audio_vae_dir, "config.json"), encoding="utf-8") as handle:
+        config = json.load(handle)
+    audio_vae = Kandinsky6AudioVAE(
+        vocoder_config=config.get("vocoder_config"),
+        mode=str(config.get("mode", "44k")),
+        need_vae_encoder=bool(config.get("need_vae_encoder", True)),
+        need_vae_decoder=bool(config.get("need_vae_decoder", True)),
+        scaling_factor=float(config.get("scaling_factor", 1.0)),
+    )
+    from safetensors.torch import load_file
+
+    state = load_file(weight_path)
+    remapped: dict[str, torch.Tensor] = {}
+    for key, value in state.items():
+        if key.startswith("native."):
+            remapped[key] = value
+            continue
+        if key.startswith(("vae.", "vocoder.")):
+            key = f"tod.{key}"
+        remapped[f"native.{key}"] = value
+    vocoder = getattr(getattr(getattr(audio_vae, "native", None), "tod", None), "vocoder", None)
+    if vocoder is not None and hasattr(vocoder, "remove_weight_norm"):
+        if not any("parametrizations" in key for key in remapped):
+            vocoder.remove_weight_norm()
+    missing, unexpected = audio_vae.load_state_dict(remapped, strict=False)
+    if missing or unexpected:
+        raise RuntimeError(
+            "Kandinsky6AudioVAE checkpoint mismatch: "
+            f"{len(missing)} missing (e.g. {missing[:5]}), "
+            f"{len(unexpected)} unexpected (e.g. {unexpected[:5]})"
+        )
+    return audio_vae.to(dtype=dtype, device=device).eval()
+
+
 def get_kandinsky6_post_process_func(od_config: OmniDiffusionConfig):
     """Factory returning the post-process function registered in
     ``vllm_omni/diffusion/registry.py``'s ``_DIFFUSION_POST_PROCESS_FUNCS``.
@@ -986,7 +1046,8 @@ class Kandinsky6TI2VAPipeline(
     supports_step_execution = True
     support_audio_output = True
     support_image_input = True
-    dummy_run_num_frames = 25
+    # Startup warmup is a 512px image-to-video probe. Skip it for the 28B DiT.
+    dummy_run_num_frames = 0
     default_num_inference_steps = 50
 
     def __init__(
@@ -1096,7 +1157,7 @@ class Kandinsky6TI2VAPipeline(
         od_config: OmniDiffusionConfig,
         prefix: str,
     ) -> tuple[nn.Module, nn.Module, nn.Module, nn.Module | None, object, object, nn.Module | None, object | None]:
-        model_root = od_config.model
+        model_root = _resolve_bundle_root(od_config.model)
         dtype = getattr(od_config, "dtype", torch.bfloat16)
         model_config = dict(od_config.model_config or {})
 
@@ -1147,7 +1208,7 @@ class Kandinsky6TI2VAPipeline(
         audio_vae = None
         audio_vae_dir = os.path.join(model_root, "audio_vae")
         if bool(model_config.get("sample_audio", True)) and os.path.isdir(audio_vae_dir):
-            audio_vae = Kandinsky6AudioVAE.from_pretrained(audio_vae_dir, torch_dtype=dtype).to(load_device).eval()
+            audio_vae = _load_audio_vae(audio_vae_dir, dtype=dtype, device=load_device)
 
         # model_config never actually carries a "scheduler_scale" key in
         # practice (nothing populates it from the checkpoint), so this always
@@ -1579,9 +1640,10 @@ class Kandinsky6TI2VAPipeline(
         )
         if generated_visual_mask is not None:
             visual_rope = torch.cat([visual_rope, visual_rope[:1]], dim=0)
-        import copy
-
-        scheduler = copy.deepcopy(self.scheduler)
+        scheduler = KandinskyFlowMatchScheduler(
+            scheduler_scale=self.scheduler.scheduler_scale,
+            device=device,
+        )
         scheduler.set_timesteps(num_inference_steps, device=device)
         text_rope, null_rope, audio_rope = self._text_ropes(
             raw_dit,
