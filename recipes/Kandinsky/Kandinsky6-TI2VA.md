@@ -4,7 +4,7 @@
 
 ## Summary
 
-- Vendor: Kandinsky Lab ([`kandinskylab/Kandinsky-6.0-Pro-sft-5s-Diffusers`](https://huggingface.co/kandinskylab/Kandinsky-6.0-Pro-sft-5s-Diffusers))
+- Vendor: Kandinsky Lab ([`kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers`](https://huggingface.co/kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers))
 - Model: Kandinsky 6 Pro (TI2VA — text/image-to-video-and-audio)
 - Task: Joint text/image-to-video-and-audio generation
 - Mode: Offline (`Omni(...)`) and online serving with the OpenAI-compatible
@@ -26,7 +26,7 @@ uncalibrated. See "Known limitations".
 
 | Task | Entrypoint | Input | Output |
 |---|---|---|---|
-| Text-to-video-and-audio | `vllm serve kandinskylab/Kandinsky-6.0-Pro-sft-5s-Diffusers --omni` / `Omni(model="kandinskylab/Kandinsky-6.0-Pro-sft-5s-Diffusers")` | text prompt | synchronized MP4 (H.264 video + AAC 44.1 kHz mono audio) |
+| Text-to-video-and-audio | `vllm serve kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers --omni` / `Omni(model="kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers")` | text prompt | synchronized MP4 (H.264 video + AAC 44.1 kHz mono audio) |
 | Image-to-video-and-audio | same | text prompt + reference image | synchronized MP4, first frame conditioned on the reference image |
 
 - Audio generation is on by default (`sample_audio=True`); pass
@@ -50,7 +50,7 @@ uncalibrated. See "Known limitations".
   port-generation repo — `src/kandinsky/ports/templates/vllm/` and
   `src/kandinsky/ports/overrides/vllm/`); the Pro DiT config comes from
   `src/kandinsky/configs/k6_pro_125_480_864_mCache_mOffload.yaml`.
-- Hub checkpoint: [`kandinskylab/Kandinsky-6.0-Pro-sft-5s-Diffusers`](https://huggingface.co/kandinskylab/Kandinsky-6.0-Pro-sft-5s-Diffusers)
+- Hub checkpoint: [`kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers`](https://huggingface.co/kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers)
 - Joint video+audio native-model reference: [`recipes/MiniMaxAI/MiniMax-H3.md`](../MiniMaxAI/MiniMax-H3.md)
 - Offline example: [`examples/offline_inference/text_to_video/text_to_video.py`](../../examples/offline_inference/text_to_video/text_to_video.py)
 - Image-to-video example: [`examples/offline_inference/image_to_video/image_to_video.py`](../../examples/offline_inference/image_to_video/image_to_video.py)
@@ -86,7 +86,7 @@ uncalibrated. See "Known limitations".
 ## Weights
 
 `Kandinsky6TI2VAPipeline._load_components` loads the public Diffusers layout
-from [`kandinskylab/Kandinsky-6.0-Pro-sft-5s-Diffusers`](https://huggingface.co/kandinskylab/Kandinsky-6.0-Pro-sft-5s-Diffusers)
+from [`kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers`](https://huggingface.co/kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers)
 (`model_index.json`, `transformer/`, `vae/`, `text_encoder/`, `tokenizer/`,
 `text_encoder_2/`, `tokenizer_2/`, `audio_vae/`, `scheduler/`). Pass that
 repo id (or a local snapshot of it) to `vllm serve` / `Omni(model=...)`.
@@ -101,7 +101,7 @@ The DiT loads with meta-device init + `load_state_dict(assign=True)`.
 ## Command
 
 ```bash
-vllm serve kandinskylab/Kandinsky-6.0-Pro-sft-5s-Diffusers --omni \
+vllm serve kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers --omni \
   --host 127.0.0.1 --port 8091 \
   --num-gpus 1 --enable-cpu-offload
 ```
@@ -115,7 +115,7 @@ Offline (writes an MP4 with the audio track muxed in):
 
 ```bash
 python examples/offline_inference/text_to_video/text_to_video.py \
-  --model kandinskylab/Kandinsky-6.0-Pro-sft-5s-Diffusers \
+  --model kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers \
   --prompt "A golden retriever runs along a sunny beach, waves crashing, cinematic footage" \
   --seed 42 --enable-cpu-offload --output kandinsky6_t2va.mp4
 # Video only: add --extra-body '{"sample_audio": false}'
@@ -125,7 +125,7 @@ Image-to-video-and-audio uses the shared image-to-video example:
 
 ```bash
 python examples/offline_inference/image_to_video/image_to_video.py \
-  --model kandinskylab/Kandinsky-6.0-Pro-sft-5s-Diffusers \
+  --model kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers \
   --image first_frame.png \
   --prompt "A golden retriever runs along a sunny beach, waves crashing, cinematic footage" \
   --seed 42 --enable-cpu-offload --output kandinsky6_i2va.mp4
@@ -255,6 +255,6 @@ decoded amplitude instead.
 | MagCache | Wired (Pro ratios, step reuse) | — |
 | TeaCache | Wired, coefficients uncalibrated | — |
 | Cache-DiT | Wired on `visual_transformer_blocks` | — |
-| FP8 | Wired (online quant; smoke peak about 46 GiB vs 75 GiB bf16) | [`docs/user_guide/diffusion/quantization.md`](../../docs/user_guide/diffusion/quantization.md) |
+| FP8 | Wired (online quant; smoke peak about 46 GiB vs 75 GiB bf16) | [`FP8 quantization`](../../docs/user_guide/quantization/fp8.md) |
 | NaviCache | Not supported | — |
 | LoRA | Not supported | — |

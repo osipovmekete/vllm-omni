@@ -16,7 +16,7 @@ from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-_HUB_MODEL = "kandinskylab/Kandinsky-6.0-Pro-sft-5s-Diffusers"
+_HUB_MODEL = "kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers"
 _LOCAL_BUNDLE = Path(__file__).resolve().parents[4] / "kandinsky6_bundle"
 
 
@@ -45,7 +45,7 @@ pytestmark = [
         reason=(
             "Kandinsky 6 Diffusers weights are gated. Set KANDINSKY6_MODEL or "
             "MODEL_PREFIX to a local copy of "
-            "kandinskylab/Kandinsky-6.0-Pro-sft-5s-Diffusers."
+            "kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers."
         ),
     ),
 ]
