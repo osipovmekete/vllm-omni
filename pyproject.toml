@@ -369,6 +369,8 @@ extend-ignore-identifiers-re = [
     # (output feature dim), not "doubt".
     ".*dout.*",
     ".*DOUT.*",
+    # Kandinsky nabla threshold argument (`thr`), not the word "the".
+    "^thr$",
 ]
 extend-ignore-re = [
     "\\.\\.\\.n,d->\\.\\.\\.nd",
@@ -409,3 +411,8 @@ IY = "IY"
 # Speech DAC codec identifiers (convnet_type, transconvnet_type) and is not a
 # typo of "convent".
 convnet = "convnet"
+# Upstream Kandinsky system prompt. "promt" and "scren" are part of the
+# conditioning text and must not be corrected.
+thr = "thr"
+promt = "promt"
+scren = "scren"

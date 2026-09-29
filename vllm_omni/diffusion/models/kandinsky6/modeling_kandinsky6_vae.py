@@ -1132,9 +1132,7 @@ class AutoencoderKLHunyuanVideo(ModelMixin, ConfigMixin, DistributedVaeMixin):
         if device is None:
             device = next(self.parameters()).device
         device = torch.device(device)
-        free_mem = (
-            float(current_omni_platform.get_free_memory(device)) if device.type != "cpu" else float("inf")
-        )
+        free_mem = float(current_omni_platform.get_free_memory(device)) if device.type != "cpu" else float("inf")
         executor = self.distributed_executor
         if (
             device.type == "cuda"
