@@ -26,16 +26,18 @@ from typing import Any, TypedDict
 import numpy as np
 import torch
 from torch import Tensor, nn
-from transformers import AutoProcessor as QwenAutoProcessor
 from transformers import (
+    AutoConfig,
     CLIPTextModel,
     CLIPTokenizer,
     Qwen2_5_VLForConditionalGeneration,
 )
+from transformers import AutoProcessor as QwenAutoProcessor
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportAudioOutput, SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.utils import _load_json
@@ -704,16 +706,12 @@ MiniMaxH3Pipeline): ``encode_prompt`` / ``prepare_latents`` / ``diffuse`` /
 ``forward`` methods, ``SupportsComponentDiscovery`` for offload/sharding,
 and ``SupportAudioOutput`` for the joint video+audio output path.
 
-Scope note: ``_load_components`` here loads each sub-component directly
-from a HF-style bundle directory (matching the same subfolder layout the
-Diffusers port's ``convert_checkpoint.py`` already produces — a single
-converted checkpoint bundle serves both targets), without vLLM-Omni's
-streamed-prefetch optimization (``DiffusersPipelineLoader.ComponentSource``,
-``prefetch_subfolders``) that e.g. SanaVideoPipeline uses for its
-transformer weights, or MagCache/NaviCache acceleration, or CFG-parallel /
-distributed execution. Those are documented follow-up work once this
-correctness-first path is validated end-to-end — not a prerequisite for
-"Kandinsky 6 TI2VA generates through vLLM-Omni" being true.
+Scope note: weights are loaded per Hub component after construction.
+``weights_sources`` points at ``transformer/``, ``vae/``, ``text_encoder/``,
+``text_encoder_2/``, and ``audio_vae/`` in
+``kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers``. ``load_weights`` maps those
+prefixes onto the pipeline modules. Tokenizers and the scheduler are not
+weight tensors; they are still read from their subfolders here.
 """
 
 # The assembler inlines these functions/classes from core/algo, core/types,
@@ -746,16 +744,86 @@ _DEFAULT_NEGATIVE_PROMPT = (
 _TRANSFORMER_WEIGHTS_NAME = "diffusion_pytorch_model.safetensors"
 
 
-def _transformer_shard_files(transformer_dir: str) -> list[str]:
-    index_path = os.path.join(transformer_dir, f"{_TRANSFORMER_WEIGHTS_NAME}.index.json")
-    if os.path.isfile(index_path):
-        with open(index_path, encoding="utf-8") as f:
-            weight_map = json.load(f)["weight_map"]
-        return [os.path.join(transformer_dir, name) for name in sorted(set(weight_map.values()))]
-    single = os.path.join(transformer_dir, _TRANSFORMER_WEIGHTS_NAME)
-    if os.path.isfile(single):
-        return [single]
-    raise FileNotFoundError(f"No {_TRANSFORMER_WEIGHTS_NAME}[.index.json] under {transformer_dir}")
+_WEIGHT_SUBFOLDERS = (
+    ("transformer", "transformer."),
+    ("vae", "vae."),
+    ("text_encoder", "text_encoder."),
+    ("text_encoder_2", "text_encoder_2."),
+    ("audio_vae", "audio_vae."),
+)
+
+
+def _resolve_bundle_root(model: str) -> str:
+    """Return a local Diffusers bundle directory for a path or Hub repo id."""
+    if os.path.isdir(model):
+        return model
+    from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+
+    return download_weights_from_hf_specific(
+        model_name_or_path=model,
+        cache_dir=None,
+        allow_patterns=["*"],
+        require_all=True,
+    )
+
+
+def _component_sources(model_root: str, *, include_audio_vae: bool) -> list:
+    """One loader source per weight folder in the Diffusers repo."""
+    sources = []
+    for subfolder, prefix in _WEIGHT_SUBFOLDERS:
+        if subfolder == "audio_vae" and not include_audio_vae:
+            continue
+        if not os.path.isdir(os.path.join(model_root, subfolder)):
+            continue
+        sources.append(
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=model_root,
+                subfolder=subfolder,
+                revision=None,
+                prefix=prefix,
+                fall_back_to_pt=True,
+            )
+        )
+    return sources
+
+
+def _adapt_k6_weight_name(name: str) -> str:
+    """Map Hub component keys onto this pipeline's module tree.
+
+    ``text_encoder/`` is Qwen2.5-VL saved with the language stack at
+    ``model.layers`` and the vision tower at ``visual.*``. This transformers
+    build nests those under ``model.language_model`` and ``model.visual``.
+    ``audio_vae/`` stores MMAudio keys at the root (``vae.*``, ``vocoder.*``,
+    ``mel_converter.*``). ``vae`` and ``vocoder`` live under ``native.tod``;
+    ``mel_converter`` lives on ``native``.
+    """
+    if name.startswith("text_encoder."):
+        rest = name[len("text_encoder.") :]
+        if rest.startswith("visual."):
+            return "text_encoder.model." + rest
+        if rest.startswith("model.") and not rest.startswith(("model.language_model.", "model.visual.")):
+            return "text_encoder.model.language_model." + rest[len("model.") :]
+        return name
+    if not name.startswith("audio_vae."):
+        return name
+    rest = name[len("audio_vae.") :]
+    if rest.startswith("native."):
+        return name
+    if rest.startswith(("vae.", "vocoder.")):
+        rest = f"tod.{rest}"
+    return f"audio_vae.native.{rest}"
+
+
+def _build_audio_vae(audio_vae_dir: str) -> nn.Module:
+    with open(os.path.join(audio_vae_dir, "config.json"), encoding="utf-8") as handle:
+        config = json.load(handle)
+    return Kandinsky6AudioVAE(
+        vocoder_config=config.get("vocoder_config"),
+        mode=str(config.get("mode", "44k")),
+        need_vae_encoder=bool(config.get("need_vae_encoder", True)),
+        need_vae_decoder=bool(config.get("need_vae_decoder", True)),
+        scaling_factor=float(config.get("scaling_factor", 1.0)),
+    )
 
 
 def _shard_loaded_weight(param: nn.Parameter, loaded_weight: Tensor) -> Tensor:
@@ -790,176 +858,6 @@ def _shard_loaded_weight(param: nn.Parameter, loaded_weight: Tensor) -> Tensor:
     if not loaded_weight.is_contiguous():
         loaded_weight = loaded_weight.contiguous()
     return loaded_weight
-
-
-def _assign_parameter(root: nn.Module, name: str, tensor: Tensor, template: nn.Parameter) -> None:
-    """Replace ``name`` with ``tensor``, keeping vLLM sharding attributes."""
-    module_name, _, param_name = name.rpartition(".")
-    module = root.get_submodule(module_name) if module_name else root
-    new_param = nn.Parameter(tensor, requires_grad=False)
-    for attr in ("output_dim", "input_dim", "weight_loader", "is_sharded_weight", "packed_dim"):
-        if hasattr(template, attr):
-            setattr(new_param, attr, getattr(template, attr))
-    module._parameters[param_name] = new_param
-
-
-def _quantize_loaded_linears(model: nn.Module, device: torch.device) -> None:
-    """Run online FP8 (or any non-unquantized method) after the bf16 assign.
-
-    ``process_weights_after_loading`` is what ``diffusers_loader`` runs; the
-    custom DiT path never entered that loader, so quantized linears stayed
-    bf16. One linear is moved to CUDA at a time so a CPU-offload load does
-    not park the whole DiT on the GPU.
-    """
-    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
-
-    quant_device = torch.device("cuda") if torch.cuda.is_available() else device
-    for module in model.modules():
-        method = getattr(module, "quant_method", None)
-        if method is None or isinstance(method, UnquantizedLinearMethod):
-            continue
-        if not hasattr(method, "process_weights_after_loading"):
-            continue
-        if quant_device.type == "cuda":
-            module.to(quant_device)
-        method.process_weights_after_loading(module)
-        # The loader's layerwise finalize deletes the "already processed" flag
-        # and calls this again. A second amax on float8 weights crashes on CPU.
-        module.quant_method.process_weights_after_loading = lambda _layer: None
-        if device.type != quant_device.type:
-            for pname, param in list(module.named_parameters(recurse=False)):
-                if param.device.type != device.type:
-                    module._parameters[pname] = nn.Parameter(param.detach().to(device), requires_grad=False)
-
-
-def _load_transformer_from_bundle(
-    transformer_dir: str,
-    *,
-    dtype: torch.dtype,
-    device: torch.device,
-    quant_config: Any = None,
-) -> Kandinsky6Transformer3DModel:
-    """Fast path for the ~28B-parameter DiT.
-
-    Builds the module with weight init skipped, then assigns each
-    safetensors tensor through the parameter's tensor-parallel shard
-    (``weight_loader`` narrowing) instead of ``load_state_dict(assign=True)``,
-    which copies the full checkpoint onto the already-sharded parameter.
-    """
-    from diffusers.models.modeling_utils import no_init_weights
-    from safetensors import safe_open
-    from vllm.model_executor.models.utils import is_pp_missing_parameter
-
-    with open(os.path.join(transformer_dir, "config.json"), encoding="utf-8") as handle:
-        config = json.load(handle)
-    with torch.device("cpu"), no_init_weights():
-        transformer = Kandinsky6Transformer3DModel.from_diffusers_config(config, quant_config=quant_config)
-    if quant_config is not None:
-        methods = {type(getattr(m, "quant_method", None)).__name__ for m in transformer.modules()}
-        print(f"[k6] DiT quant methods: {sorted(methods)}", flush=True)
-
-    params = dict(transformer.named_parameters())
-    seen: set[str] = set()
-    unexpected: list[str] = []
-    for shard in _transformer_shard_files(transformer_dir):
-        with safe_open(shard, framework="pt", device=str(device)) as handle:
-            for key in handle.keys():
-                if is_pp_missing_parameter(key, transformer):
-                    seen.add(key)
-                    continue
-                if key not in params:
-                    unexpected.append(key)
-                    continue
-                tensor = handle.get_tensor(key)
-                # Online FP8 quantizes bf16 on CUDA inside
-                # ``process_weights_after_loading``. Casting to float8 here
-                # makes that amax run on CPU, which has no float8 kernel.
-                target_dtype = torch.bfloat16 if quant_config is not None else dtype
-                if tensor.is_floating_point() and tensor.dtype != target_dtype:
-                    tensor = tensor.to(target_dtype)
-                tensor = _shard_loaded_weight(params[key], tensor)
-                if tuple(tensor.shape) != tuple(params[key].shape):
-                    raise RuntimeError(
-                        f"Kandinsky6 weight {key}: checkpoint shard {tuple(tensor.shape)} "
-                        f"!= parameter {tuple(params[key].shape)}"
-                    )
-                _assign_parameter(transformer, key, tensor, params[key])
-                seen.add(key)
-                del tensor
-    missing = [name for name in params if name not in seen]
-    if missing or unexpected:
-        raise RuntimeError(
-            "Kandinsky6Transformer3DModel checkpoint mismatch: "
-            f"{len(missing)} missing (e.g. {missing[:5]}), "
-            f"{len(unexpected)} unexpected (e.g. {unexpected[:5]})"
-        )
-    if quant_config is not None:
-        _quantize_loaded_linears(transformer, device)
-    for name, buf in transformer.named_buffers():
-        if buf.device != device:
-            module_name, _, buf_name = name.rpartition(".")
-            transformer.get_submodule(module_name)._buffers[buf_name] = buf.to(device=device)
-    transformer.requires_grad_(False)
-    return transformer.eval()
-
-
-def _resolve_bundle_root(model: str) -> str:
-    """Return a local Diffusers bundle directory for a path or Hub repo id."""
-    if os.path.isdir(model):
-        return model
-    from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
-
-    return download_weights_from_hf_specific(
-        model_name_or_path=model,
-        cache_dir=None,
-        allow_patterns=["*"],
-        require_all=True,
-    )
-
-
-def _load_audio_vae(audio_vae_dir: str, *, dtype: torch.dtype, device: torch.device) -> nn.Module:
-    """Load ``audio_vae/`` from a Diffusers bundle.
-
-    Official Hub checkpoints store ``FeaturesUtils`` keys at the root
-    (``vae.*`` / ``vocoder.*``, or older ``tod.vae.*``). ``Kandinsky6AudioVAE``
-    nests that module as ``native.tod``.
-    """
-    weight_path = os.path.join(audio_vae_dir, "diffusion_pytorch_model.safetensors")
-    if not os.path.isfile(weight_path):
-        return Kandinsky6AudioVAE.from_pretrained(audio_vae_dir, torch_dtype=dtype).to(device).eval()
-
-    with open(os.path.join(audio_vae_dir, "config.json"), encoding="utf-8") as handle:
-        config = json.load(handle)
-    audio_vae = Kandinsky6AudioVAE(
-        vocoder_config=config.get("vocoder_config"),
-        mode=str(config.get("mode", "44k")),
-        need_vae_encoder=bool(config.get("need_vae_encoder", True)),
-        need_vae_decoder=bool(config.get("need_vae_decoder", True)),
-        scaling_factor=float(config.get("scaling_factor", 1.0)),
-    )
-    from safetensors.torch import load_file
-
-    state = load_file(weight_path)
-    remapped: dict[str, torch.Tensor] = {}
-    for key, value in state.items():
-        if key.startswith("native."):
-            remapped[key] = value
-            continue
-        if key.startswith(("vae.", "vocoder.")):
-            key = f"tod.{key}"
-        remapped[f"native.{key}"] = value
-    vocoder = getattr(getattr(getattr(audio_vae, "native", None), "tod", None), "vocoder", None)
-    if vocoder is not None and hasattr(vocoder, "remove_weight_norm"):
-        if not any("parametrizations" in key for key in remapped):
-            vocoder.remove_weight_norm()
-    missing, unexpected = audio_vae.load_state_dict(remapped, strict=False)
-    if missing or unexpected:
-        raise RuntimeError(
-            "Kandinsky6AudioVAE checkpoint mismatch: "
-            f"{len(missing)} missing (e.g. {missing[:5]}), "
-            f"{len(unexpected)} unexpected (e.g. {unexpected[:5]})"
-        )
-    return audio_vae.to(dtype=dtype, device=device).eval()
 
 
 def get_kandinsky6_post_process_func(od_config: OmniDiffusionConfig):
@@ -1146,10 +1044,9 @@ class Kandinsky6TI2VAPipeline(
             )
 
     # ------------------------------------------------------------------
-    # Component loading — direct from a converted-checkpoint bundle
-    # directory (same subfolder layout as the Diffusers port's
-    # convert_checkpoint.py output). See the module docstring for the
-    # intentional scope cut vs. SanaVideoPipeline's streamed prefetch.
+    # Modules are constructed empty. ``weights_sources`` then loads each
+    # Hub folder (transformer, vae, text_encoder, text_encoder_2, audio_vae)
+    # on its own.
     # ------------------------------------------------------------------
 
     def _load_components(
@@ -1157,15 +1054,16 @@ class Kandinsky6TI2VAPipeline(
         od_config: OmniDiffusionConfig,
         prefix: str,
     ) -> tuple[nn.Module, nn.Module, nn.Module, nn.Module | None, object, object, nn.Module | None, object | None]:
+        del prefix
+        from diffusers.models.modeling_utils import no_init_weights
+
         model_root = _resolve_bundle_root(od_config.model)
         dtype = getattr(od_config, "dtype", torch.bfloat16)
         model_config = dict(od_config.model_config or {})
 
-        # With any CPU-offload strategy the framework loader constructs the
-        # pipeline under a CPU device context and the offload backend owns
-        # GPU placement afterwards (encoders/VAEs pinned, DiT swapped in on
-        # forward). Loading straight to the GPU here would OOM: the bf16 DiT
-        # alone is ~56 GiB and Qwen2.5-VL-7B another ~17 GiB.
+        # Keep the empty modules on CPU when offload will own GPU placement.
+        # Allocating the bf16 DiT (~56 GiB) plus Qwen (~17 GiB) on the GPU
+        # before weights arrive does not fit an 80 GB device.
         offload_requested = bool(
             getattr(od_config, "enable_cpu_offload", False)
             or getattr(od_config, "enable_layerwise_offload", False)
@@ -1174,22 +1072,27 @@ class Kandinsky6TI2VAPipeline(
         load_device = torch.device("cpu") if offload_requested else self.device
 
         transformer_dir = os.path.join(model_root, "transformer")
-        transformer = _load_transformer_from_bundle(
-            transformer_dir,
-            dtype=dtype,
-            device=load_device,
-            quant_config=getattr(od_config, "quantization_config", None),
-        )
+        with open(os.path.join(transformer_dir, "config.json"), encoding="utf-8") as handle:
+            transformer_config = json.load(handle)
+        with torch.device(load_device), no_init_weights():
+            transformer = Kandinsky6Transformer3DModel.from_diffusers_config(
+                transformer_config,
+                quant_config=getattr(od_config, "quantization_config", None),
+            )
 
         vae_dir = os.path.join(model_root, "vae")
-        vae = AutoencoderKLHunyuanVideo.from_pretrained(vae_dir, torch_dtype=torch.float16).to(load_device).eval()
+        with open(os.path.join(vae_dir, "config.json"), encoding="utf-8") as handle:
+            vae_config = json.load(handle)
+        with torch.device(load_device), no_init_weights():
+            vae = AutoencoderKLHunyuanVideo.from_config(vae_config)
+        vae.to(dtype=torch.float16)
 
         text_encoder_dir = os.path.join(model_root, "text_encoder")
-        text_encoder = (
-            Qwen2_5_VLForConditionalGeneration.from_pretrained(text_encoder_dir, torch_dtype=dtype)
-            .to(load_device)
-            .eval()
-        )
+        text_encoder_config = AutoConfig.from_pretrained(text_encoder_dir)
+        with torch.device(load_device), no_init_weights():
+            text_encoder = Qwen2_5_VLForConditionalGeneration(text_encoder_config)
+        text_encoder.to(dtype=dtype)
+
         # Tokenizer/processor files live in the sibling `tokenizer/` directory
         # (standard Diffusers multi-component layout), not inside
         # `text_encoder/` itself — that dir only has the model weights/config.
@@ -1202,13 +1105,21 @@ class Kandinsky6TI2VAPipeline(
         tokenizer.tokenizer.padding_side = "right"
 
         clip_dir = os.path.join(model_root, "text_encoder_2")
-        text_encoder_2 = CLIPTextModel.from_pretrained(clip_dir, torch_dtype=dtype).to(load_device).eval()
+        clip_config = AutoConfig.from_pretrained(clip_dir)
+        with torch.device(load_device), no_init_weights():
+            text_encoder_2 = CLIPTextModel(clip_config)
+        text_encoder_2.to(dtype=dtype)
         tokenizer_2 = CLIPTokenizer.from_pretrained(os.path.join(model_root, "tokenizer_2"))
 
         audio_vae = None
         audio_vae_dir = os.path.join(model_root, "audio_vae")
-        if bool(model_config.get("sample_audio", True)) and os.path.isdir(audio_vae_dir):
-            audio_vae = _load_audio_vae(audio_vae_dir, dtype=dtype, device=load_device)
+        include_audio_vae = bool(model_config.get("sample_audio", True)) and os.path.isdir(audio_vae_dir)
+        if include_audio_vae:
+            with torch.device(load_device), no_init_weights():
+                audio_vae = _build_audio_vae(audio_vae_dir)
+            audio_vae.to(dtype=dtype)
+
+        self.weights_sources = _component_sources(model_root, include_audio_vae=include_audio_vae)
 
         # model_config never actually carries a "scheduler_scale" key in
         # practice (nothing populates it from the checkpoint), so this always
@@ -1227,19 +1138,28 @@ class Kandinsky6TI2VAPipeline(
 
         return transformer, vae, text_encoder, audio_vae, scheduler, tokenizer, text_encoder_2, tokenizer_2
 
-    def load_weights(self, weights: Iterable[tuple[str, Tensor]]) -> set[str] | None:
-        """No-op for the framework loader: every component (transformer, vae,
-        audio_vae, text_encoder, text_encoder_2) is self-loaded via
-        ``_load_components()``'s per-module ``from_pretrained()`` calls in
-        ``__init__``. We expose no ``weights_sources``, so the framework
-        loader's generic top-level scan can't see any of that; returning
-        ``None`` (same fix as Pi0Pipeline.load_weights, which self-loads for
-        the same reason) skips its strict unloaded-weights check instead of
-        misreporting every parameter as missing.
+    def load_weights(self, weights: Iterable[tuple[str, Tensor]]) -> set[str]:
+        """Load each Hub folder into its module.
+
+        The framework yields ``transformer.*``, ``vae.*``, ``text_encoder.*``,
+        ``text_encoder_2.*``, and ``audio_vae.*`` from ``weights_sources``.
         """
-        for _ in weights:
-            pass
-        return None
+        from vllm.model_executor.models.utils import AutoWeightsLoader, is_pp_missing_parameter
+
+        quant_config = getattr(self.od_config, "quantization_config", None)
+
+        def adapted():
+            for name, tensor in weights:
+                if name.startswith("transformer."):
+                    key = name[len("transformer.") :]
+                    if is_pp_missing_parameter(key, self.transformer):
+                        continue
+                    if quant_config is not None and tensor.is_floating_point() and tensor.dtype != torch.bfloat16:
+                        tensor = tensor.to(torch.bfloat16)
+                name = _adapt_k6_weight_name(name)
+                yield name, tensor
+
+        return AutoWeightsLoader(self).load_weights(adapted())
 
     # ------------------------------------------------------------------
     # Prompt encoding — same Qwen2.5-VL + CLIP dual-encoder logic as the

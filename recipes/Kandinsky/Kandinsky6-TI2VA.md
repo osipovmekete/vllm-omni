@@ -96,7 +96,7 @@ A raw Kandinsky 6 weight tree is not required. If you already have a local
 Diffusers-layout snapshot, point `--model` at that directory instead of the
 Hub id.
 
-The DiT loads with meta-device init + `load_state_dict(assign=True)`.
+Each weight folder is loaded on its own (`transformer/`, `vae/`, `text_encoder/`, `text_encoder_2/`, `audio_vae/`). The DiT is built with initialization skipped, then the framework loader fills it from `transformer/`.
 
 ## Command
 

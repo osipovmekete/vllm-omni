@@ -205,3 +205,39 @@ def test_kandinsky6_pre_process_func_is_identity_for_now():
     sentinel = object()
 
     assert pre_process(sentinel) is sentinel
+
+
+def test_hub_component_keys_map_onto_pipeline_modules():
+    """Hub folder keys from Kandinsky-6.0-Pro-5s-Diffusers land on the modules."""
+    from vllm_omni.diffusion.models.kandinsky6.pipeline_kandinsky6 import (
+        _WEIGHT_SUBFOLDERS,
+        _adapt_k6_weight_name,
+    )
+
+    assert _WEIGHT_SUBFOLDERS == (
+        ("transformer", "transformer."),
+        ("vae", "vae."),
+        ("text_encoder", "text_encoder."),
+        ("text_encoder_2", "text_encoder_2."),
+        ("audio_vae", "audio_vae."),
+    )
+    assert _adapt_k6_weight_name("transformer.visual_embeddings.proj.weight") == (
+        "transformer.visual_embeddings.proj.weight"
+    )
+    assert _adapt_k6_weight_name("vae.decoder.conv_in.conv.weight") == "vae.decoder.conv_in.conv.weight"
+    assert _adapt_k6_weight_name("text_encoder_2.encoder.layers.0.mlp.fc1.weight") == (
+        "text_encoder_2.encoder.layers.0.mlp.fc1.weight"
+    )
+    assert (
+        _adapt_k6_weight_name("text_encoder.model.layers.0.input_layernorm.weight")
+        == "text_encoder.model.language_model.layers.0.input_layernorm.weight"
+    )
+    assert _adapt_k6_weight_name("text_encoder.visual.blocks.0.norm1.weight") == (
+        "text_encoder.model.visual.blocks.0.norm1.weight"
+    )
+    assert (
+        _adapt_k6_weight_name("audio_vae.vae.decoder.conv_in.weight")
+        == "audio_vae.native.tod.vae.decoder.conv_in.weight"
+    )
+    assert _adapt_k6_weight_name("audio_vae.vocoder.conv_pre.weight") == "audio_vae.native.tod.vocoder.conv_pre.weight"
+    assert _adapt_k6_weight_name("audio_vae.mel_converter.hann_window") == "audio_vae.native.mel_converter.hann_window"

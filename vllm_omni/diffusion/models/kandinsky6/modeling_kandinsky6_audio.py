@@ -462,8 +462,12 @@ class VAE(nn.Module):
         dec = self.decode(z, unnormalize=unnormalize)
         return dec, posterior
 
-    def load_weights(self, src_dict) -> None:
+    def load_weights(self, src_dict) -> set[str]:
+        """Load a state dict, or the ``(name, tensor)`` stream from AutoWeightsLoader."""
+        if not isinstance(src_dict, dict):
+            src_dict = dict(src_dict)
         self.load_state_dict(src_dict, strict=True)
+        return set(src_dict)
 
     @property
     def device(self) -> torch.device:

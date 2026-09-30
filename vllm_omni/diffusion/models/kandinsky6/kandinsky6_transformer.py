@@ -1183,10 +1183,10 @@ class Kandinsky6Transformer3DModel(nn.Module):
     ``convert_checkpoint.py --use-patched-diffusers`` bundle directly.
 
     The class is a plain ``nn.Module``. ``from_diffusers_config`` reads the
-    bundle ``config.json`` and ``_load_transformer_from_bundle`` assigns
-    safetensors. Full checkpoint tensors are narrowed onto each rank's
-    ``ColumnParallelLinear`` / ``RowParallelLinear`` shard by
-    ``_shard_loaded_weight`` in the pipeline loader.
+    bundle ``config.json``. Safetensors from ``transformer/`` are applied
+    later by the pipeline ``load_weights`` path, which narrows full
+    checkpoint tensors onto each rank's ``ColumnParallelLinear`` /
+    ``RowParallelLinear`` shard.
     """
 
     _repeated_blocks = [
