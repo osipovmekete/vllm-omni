@@ -973,7 +973,7 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.videoT = Kandinsky6TransformerDecoderBlock(
+        self.video_dec_block = Kandinsky6TransformerDecoderBlock(
             model_dim,
             time_dim,
             ff_dim,
@@ -982,9 +982,9 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
             text_token_padding,
             self_sequence_parallel=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.videoT" if prefix else "videoT",
+            prefix=f"{prefix}.video_dec_block" if prefix else "video_dec_block",
         )
-        self.audioT = Kandinsky6TransformerDecoderBlock(
+        self.audio_dec_block = Kandinsky6TransformerDecoderBlock(
             model_dim_a,
             time_dim_a,
             ff_dim_a,
@@ -993,7 +993,7 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
             text_token_padding,
             self_sequence_parallel=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.audioT" if prefix else "audioT",
+            prefix=f"{prefix}.audio_dec_block" if prefix else "audio_dec_block",
         )
 
         self.va_cross_attention = Kandinsky6Attention(
@@ -1061,13 +1061,13 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
 
         # ---- video backbone ----
         if vis is not None:
-            sa_p, ca_p, ff_p = torch.chunk(self.videoT.visual_modulation(t_v), 3, dim=-1)
+            sa_p, ca_p, ff_p = torch.chunk(self.video_dec_block.visual_modulation(t_v), 3, dim=-1)
 
             shift, scale, gate = torch.chunk(sa_p, 3, dim=-1)
             vis = apply_gate_sum(
                 vis,
-                self.videoT.self_attention(
-                    apply_scale_shift_norm(self.videoT.self_attention_norm, vis, scale, shift),
+                self.video_dec_block.self_attention(
+                    apply_scale_shift_norm(self.video_dec_block.self_attention_norm, vis, scale, shift),
                     rotary_emb=vis_rope,
                     sparse_params=sparse_params,
                 ),
@@ -1075,26 +1075,26 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
             ).type_as(vis)
 
             shift, scale, gate_v = torch.chunk(ca_p, 3, dim=-1)
-            vis_pre_ca = apply_scale_shift_norm(self.videoT.cross_attention_norm, vis, scale, shift).type_as(vis)
-            vis_out_t = self.videoT.cross_attention(vis_pre_ca, encoder_hidden_states=text_v, attn_mask=attn_mask)
+            vis_pre_ca = apply_scale_shift_norm(self.video_dec_block.cross_attention_norm, vis, scale, shift).type_as(vis)
+            vis_out_t = self.video_dec_block.cross_attention(vis_pre_ca, encoder_hidden_states=text_v, attn_mask=attn_mask)
 
         # ---- audio backbone ----
         if aud is not None:
-            sa_p, ca_p, ff_p_a = torch.chunk(self.audioT.visual_modulation(t_a), 3, dim=-1)
+            sa_p, ca_p, ff_p_a = torch.chunk(self.audio_dec_block.visual_modulation(t_a), 3, dim=-1)
 
             shift, scale, gate = torch.chunk(sa_p, 3, dim=-1)
             aud = apply_gate_sum(
                 aud,
-                self.audioT.self_attention(
-                    apply_scale_shift_norm(self.audioT.self_attention_norm, aud, scale, shift),
+                self.audio_dec_block.self_attention(
+                    apply_scale_shift_norm(self.audio_dec_block.self_attention_norm, aud, scale, shift),
                     rotary_emb=aud_rope,
                 ),
                 gate,
             ).type_as(aud)
 
             shift, scale, gate_a = torch.chunk(ca_p, 3, dim=-1)
-            aud_pre_ca = apply_scale_shift_norm(self.audioT.cross_attention_norm, aud, scale, shift).type_as(aud)
-            aud_out_t = self.audioT.cross_attention(aud_pre_ca, encoder_hidden_states=text_a, attn_mask=attn_mask)
+            aud_pre_ca = apply_scale_shift_norm(self.audio_dec_block.cross_attention_norm, aud, scale, shift).type_as(aud)
+            aud_out_t = self.audio_dec_block.cross_attention(aud_pre_ca, encoder_hidden_states=text_a, attn_mask=attn_mask)
             aud = apply_gate_sum(aud, aud_out_t, gate_a).type_as(aud)
 
             # ---- cross-modal attention ----
@@ -1154,7 +1154,7 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
             shift, scale, gate = torch.chunk(ff_p, 3, dim=-1)
             vis = apply_gate_sum(
                 vis,
-                self.videoT.feed_forward(apply_scale_shift_norm(self.videoT.feed_forward_norm, vis, scale, shift)),
+                self.video_dec_block.feed_forward(apply_scale_shift_norm(self.video_dec_block.feed_forward_norm, vis, scale, shift)),
                 gate,
             ).type_as(vis)
 
@@ -1162,7 +1162,7 @@ class Kandinsky6FusedTransformerDecoderBlock(nn.Module):
             shift, scale, gate = torch.chunk(ff_p_a, 3, dim=-1)
             aud = apply_gate_sum(
                 aud,
-                self.audioT.feed_forward(apply_scale_shift_norm(self.audioT.feed_forward_norm, aud, scale, shift)),
+                self.audio_dec_block.feed_forward(apply_scale_shift_norm(self.audio_dec_block.feed_forward_norm, aud, scale, shift)),
                 gate,
             ).type_as(aud)
 

@@ -221,8 +221,11 @@ def test_hub_component_keys_map_onto_pipeline_modules():
         ("text_encoder_2", "text_encoder_2."),
         ("audio_vae", "audio_vae."),
     )
-    assert _adapt_k6_weight_name("transformer.visual_embeddings.proj.weight") == (
-        "transformer.visual_embeddings.proj.weight"
+    assert _adapt_k6_weight_name("transformer.visual_transformer_blocks.0.videoT.self_attention.to_query.weight") == (
+        "transformer.visual_transformer_blocks.0.video_dec_block.self_attention.to_query.weight"
+    )
+    assert _adapt_k6_weight_name("transformer.visual_transformer_blocks.0.audioT.feed_forward.in_layer.weight") == (
+        "transformer.visual_transformer_blocks.0.audio_dec_block.feed_forward.in_layer.weight"
     )
     assert _adapt_k6_weight_name("vae.decoder.conv_in.conv.weight") == "vae.decoder.conv_in.conv.weight"
     assert _adapt_k6_weight_name("text_encoder_2.encoder.layers.0.mlp.fc1.weight") == (

@@ -302,8 +302,8 @@ def test_dit_constructs_from_a_diffusers_config_dict():
         "Kandinsky6TransformerEncoderBlock",
         "Kandinsky6TransformerDecoderBlock",
     ]
-    visual = model.visual_transformer_blocks[0].videoT.self_attention.attn
-    audio = model.visual_transformer_blocks[0].audioT.self_attention.attn
+    visual = model.visual_transformer_blocks[0].video_dec_block.self_attention.attn
+    audio = model.visual_transformer_blocks[0].audio_dec_block.self_attention.attn
     text = model.video_text_transformer_blocks[0].self_attention.attn
     cross = model.visual_transformer_blocks[0].va_cross_attention.attn
     assert visual.role == "kandinsky6.visual_self"

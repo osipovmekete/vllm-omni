@@ -797,6 +797,11 @@ def _adapt_k6_weight_name(name: str) -> str:
     ``mel_converter.*``). ``vae`` and ``vocoder`` live under ``native.tod``;
     ``mel_converter`` lives on ``native``.
     """
+    if name.startswith("transformer."):
+        # Released Pro-5s checkpoints use the pre-rename block names.
+        rest = name[len("transformer.") :]
+        rest = rest.replace(".videoT.", ".video_dec_block.").replace(".audioT.", ".audio_dec_block.")
+        return "transformer." + rest
     if name.startswith("text_encoder."):
         rest = name[len("text_encoder.") :]
         if rest.startswith("visual."):
@@ -1500,7 +1505,8 @@ class Kandinsky6TI2VAPipeline(
         guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else 5.0
         extra_args = sampling.extra_args or {}
         sample_audio = bool(extra_args.get("sample_audio", True))
-        visual_cond_scheme = extra_args.get("visual_cond_scheme") or ("tail_cond_first_frame" if image else "pretrain")
+        # The Diffusers TI2VA pipeline always appends a reference image as a masked tail frame.
+        visual_cond_scheme = "tail_cond_first_frame" if image else "pretrain"
         generator = sampling.generator
         if generator is None and sampling.seed is not None:
             generator = torch.Generator(device=self.device).manual_seed(sampling.seed)
@@ -1729,7 +1735,8 @@ class Kandinsky6TI2VAPipeline(
         # ``normalize`` (peak-normalize each waveform) matches the k6_video
         # production pipeline; ``clip`` keeps the raw decoded amplitude.
         audio_normalization = str(extra_args.get("audio_normalization", "normalize"))
-        visual_cond_scheme = extra_args.get("visual_cond_scheme") or ("tail_cond_first_frame" if image else "pretrain")
+        # The Diffusers TI2VA pipeline always appends a reference image as a masked tail frame.
+        visual_cond_scheme = "tail_cond_first_frame" if image else "pretrain"
 
         generator = sampling.generator
         if generator is None and sampling.seed is not None:
