@@ -46,10 +46,6 @@ uncalibrated. See "Known limitations".
 
 ## References
 
-- Native implementation source: `k6_video` (internal portable-core +
-  port-generation repo — `src/kandinsky/ports/templates/vllm/` and
-  `src/kandinsky/ports/overrides/vllm/`); the Pro DiT config comes from
-  `src/kandinsky/configs/k6_pro_125_480_864_mCache_mOffload.yaml`.
 - Hub checkpoint: [`kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers`](https://huggingface.co/kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers)
 - Joint video+audio native-model reference: [`recipes/MiniMaxAI/MiniMax-H3.md`](../MiniMaxAI/MiniMax-H3.md)
 - Offline example: [`examples/offline_inference/text_to_video/text_to_video.py`](../../examples/offline_inference/text_to_video/text_to_video.py)
@@ -163,35 +159,26 @@ Single H100 80GB, seed 42, prompt
 negative prompt left at the pipeline default, MagCache off, prompt expansion
 off. Pro geometry: 864x480, 125 frames, 50 steps, CFG 5.0, audio on.
 
-vLLM-Omni: `text_to_video.py --enable-cpu-offload --model-class-name Kandinsky6TI2VAPipeline`,
-FlashAttention-3. Native: `kandy generate` from `k6_video` with
-`k6_pro_125_480_864_mCache_mOffload.yaml`, `--no-magcache --expand-prompts 0
---offload module`, FlashAttention-3.
+vLLM-Omni: `text_to_video.py --model kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers --enable-cpu-offload --model-class-name Kandinsky6TI2VAPipeline`,
+FlashAttention-3.
 
-| Stack | Wall / generation | Step time | Peak GPU | After load |
-|---|---|---|---|---|
-| vLLM-Omni | 751.7 s generation (12.5 min); engine init 41 s | 14.4 s/it average | 78.39 GiB reserved (78.0 GiB nvidia-smi) | 17.74 GiB |
-| Native `k6_video` | 959 s process (16.0 min), including weight load | not logged | 66.3 GiB nvidia-smi | — |
+| Wall / generation | Step time | Peak GPU | After load |
+|---|---|---|---|
+| 751.7 s generation (12.5 min); engine init 41 s | 14.4 s/it average | 78.39 GiB reserved (78.0 GiB nvidia-smi) | 17.74 GiB |
 
 An earlier SDPA vLLM-Omni Pro run on the same GPU was 26.9 s/it and 1377 s,
 peak reserved 74.97 GiB. A 512x320 / 25-frame / 10-step SDPA smoke was 1.4 s/it
 and 29.5 s at the same reserved peak.
 
-Both MP4s are H.264 864x480, 125 frames at 24 fps (5.22 s), plus AAC 44.1 kHz
-mono (230400 samples). Pixel PSNR between them is 8.5 dB (mean absolute
-difference 77/255). Audio sample correlation is about 0. Both show a golden
-retriever on a sunny beach with breaking waves for the full clip; the shots
-are different (wide beach, then the dog running, then the dog beside a rock
-on the native side; a close dog, then the dog on the shoreline, then the dog
-running into the surf on the vLLM-Omni side). Same seed does not produce the
-same noise, so bit-exact parity is not expected.
+The MP4 is H.264 864x480, 125 frames at 24 fps (5.22 s), plus AAC 44.1 kHz
+mono (230400 samples): a golden retriever on a sunny beach with breaking waves.
 
 vLLM-Omni's VAE decode logged two failed CUDA allocations (7.15 GiB, then
 4.27 GiB) and still wrote a complete file.
 
-Audio is peak-normalized to full scale by default, as in the production
-pipeline; pass `extra_args.audio_normalization="clip"` to keep the raw
-decoded amplitude instead.
+Audio is peak-normalized to full scale by default; pass
+`extra_args.audio_normalization="clip"` to keep the raw decoded amplitude
+instead.
 
 ## Notes
 
