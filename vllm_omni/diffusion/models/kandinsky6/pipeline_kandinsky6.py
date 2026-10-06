@@ -41,6 +41,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.interface import SupportAudioOutput, SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.utils import _load_json
+from vllm_omni.diffusion.offloader.config import offload_enabled
 from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -1069,12 +1070,7 @@ class Kandinsky6TI2VAPipeline(
         # Keep the empty modules on CPU when offload will own GPU placement.
         # Allocating the bf16 DiT (~56 GiB) plus Qwen (~17 GiB) on the GPU
         # before weights arrive does not fit an 80 GB device.
-        offload_requested = bool(
-            getattr(od_config, "enable_cpu_offload", False)
-            or getattr(od_config, "enable_layerwise_offload", False)
-            or getattr(od_config, "enable_distributed_layerwise_offload", False)
-        )
-        load_device = torch.device("cpu") if offload_requested else self.device
+        load_device = torch.device("cpu") if offload_enabled(od_config) else self.device
 
         transformer_dir = os.path.join(model_root, "transformer")
         with open(os.path.join(transformer_dir, "config.json"), encoding="utf-8") as handle:
