@@ -7,6 +7,72 @@ import pytest
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
+@pytest.mark.parametrize("distilled", [False, True])
+@pytest.mark.parametrize("entrypoint", ["api", "offline"])
+def test_checkpoint_defaults_reach_pipeline_from_shared_entrypoints(monkeypatch, distilled, entrypoint):
+    """Shared wrappers must leave checkpoint-dependent fields unspecified."""
+    import torch
+
+    from vllm_omni.diffusion.models.kandinsky6 import KandinskyFlowMatchScheduler, KandinskyPiFlowScheduler
+    from vllm_omni.diffusion.models.kandinsky6 import pipeline_kandinsky6 as module
+    from vllm_omni.entrypoints.openai.protocol.videos import VideoGenerationRequest
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+    from vllm_omni.model_extras import get_video_generation_defaults
+
+    defaults = get_video_generation_defaults("Kandinsky6TI2VAPipeline")
+    assert defaults is not None
+    assert defaults.max_area is None
+    if entrypoint == "api":
+        request = VideoGenerationRequest(prompt="A fox runs through snow")
+        vp = request.resolve_video_params(default_fps=defaults.fps, default_num_frames=defaults.num_frames)
+        sampling = OmniDiffusionSamplingParams(height=vp.height, width=vp.width)
+        if vp.num_frames is not None:
+            sampling.num_frames = vp.num_frames
+        sampling.num_inference_steps = defaults.num_inference_steps
+    else:
+        preset = defaults.cli_defaults()
+        assert "guidance_scale" not in preset
+        sampling = OmniDiffusionSamplingParams(
+            **{key: preset[key] for key in ("height", "width", "num_frames", "num_inference_steps")}
+        )
+
+    monkeypatch.setattr(module, "get_local_device", lambda: torch.device("cpu"))
+    scheduler = (KandinskyPiFlowScheduler if distilled else KandinskyFlowMatchScheduler)()
+    pipeline = module.Kandinsky6TI2VAPipeline(
+        transformer=torch.nn.Identity(), vae=torch.nn.Identity(), text_encoder=torch.nn.Identity(), scheduler=scheduler
+    )
+    assert pipeline._resolve_generation_settings(sampling) == (
+        480,
+        864,
+        121 if distilled else 125,
+        10 if distilled else 50,
+        1.0 if distilled else 5.0,
+    )
+    explicit = OmniDiffusionSamplingParams(
+        height=320, width=512, num_frames=25, num_inference_steps=3, guidance_scale=1.0
+    )
+    # The worker marks explicit guidance before either pipeline entrypoint.
+    explicit.guidance_scale_provided = True
+    assert pipeline._resolve_generation_settings(explicit) == (320, 512, 25, 3, 1.0)
+
+
+def test_checkpoint_scheduler_config_overrides_generation_defaults(monkeypatch):
+    import torch
+
+    from vllm_omni.diffusion.models.kandinsky6 import KandinskyPiFlowScheduler
+    from vllm_omni.diffusion.models.kandinsky6 import pipeline_kandinsky6 as module
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    monkeypatch.setattr(module, "get_local_device", lambda: torch.device("cpu"))
+    scheduler = KandinskyPiFlowScheduler()
+    scheduler.default_num_frames = 97
+    scheduler.default_num_inference_steps = 6
+    pipeline = module.Kandinsky6TI2VAPipeline(
+        transformer=torch.nn.Identity(), vae=torch.nn.Identity(), text_encoder=torch.nn.Identity(), scheduler=scheduler
+    )
+    assert pipeline._resolve_generation_settings(OmniDiffusionSamplingParams()) == (480, 864, 97, 6, 1.0)
+
+
 def test_kandinsky6_pipeline_import_and_registry():
     from vllm_omni.diffusion.models.kandinsky6 import (
         AutoencoderKLHunyuanVideo,
