@@ -50,6 +50,11 @@ from .kandinsky6_transformer import Kandinsky6Transformer3DModel
 from .modeling_kandinsky6_audio import Kandinsky6AudioVAE
 from .modeling_kandinsky6_vae import AutoencoderKLHunyuanVideo
 from .scheduling_kandinsky6 import KandinskyFlowMatchScheduler, KandinskyPiFlowScheduler
+from .super_resolution import (
+    Kandinsky6SuperResolution,
+    resolve_super_resolution,
+    validate_super_resolution_execution,
+)
 
 
 class TextEmbeds(TypedDict):
@@ -1008,6 +1013,7 @@ class Kandinsky6TI2VAPipeline(
     ) -> None:
         super().__init__()
         self.od_config = od_config
+        self._super_resolution = None
         self.device = get_local_device()
 
         if od_config is not None:
@@ -1551,13 +1557,24 @@ class Kandinsky6TI2VAPipeline(
         num_frames = sampling.num_frames
         if num_frames is None or num_frames == 1:
             num_frames = self.default_num_frames
+        sr = resolve_super_resolution(sampling)
+        if sr is not None:
+            validate_super_resolution_execution(self.od_config)
         return (
-            sampling.height or self.default_height,
-            sampling.width or self.default_width,
+            self.default_height if sr is not None else (sampling.height or self.default_height),
+            self.default_width if sr is not None else (sampling.width or self.default_width),
             num_frames,
             sampling.num_inference_steps or self.default_num_inference_steps,
             sampling.guidance_scale if sampling.guidance_scale_provided else self.default_guidance_scale,
         )
+
+    def _refine_generated_video(self, video: np.ndarray, sampling: Any) -> np.ndarray:
+        settings = resolve_super_resolution(sampling)
+        if settings is None:
+            return video
+        if self._super_resolution is None:
+            self._super_resolution = Kandinsky6SuperResolution(self)
+        return self._super_resolution.refine(video, sampling, settings)
 
     def prepare_encode(self, state: Any, **kwargs: Any) -> Any:
         """Encode one request and store everything the denoise step needs."""
@@ -1789,6 +1806,8 @@ class Kandinsky6TI2VAPipeline(
             else None
         )
         audio_sample_rate = self.audio_sample_rate if audio_out is not None else None
+        if state.sampling.output_type != "latent":
+            video_out = self._refine_generated_video(video_out, state.sampling)
         return DiffusionOutput(output={"video": video_out, "audio": audio_out, "audio_sample_rate": audio_sample_rate})
 
     @torch.no_grad()
@@ -1945,6 +1964,8 @@ class Kandinsky6TI2VAPipeline(
             postprocess_audio(result, self.audio_vae, normalization_mode=audio_normalization) if sample_audio else None
         )
         audio_sample_rate = self.audio_sample_rate if audio_out is not None else None
+        if sampling.output_type != "latent":
+            video_out = self._refine_generated_video(video_out, sampling)
         return DiffusionOutput(output={"video": video_out, "audio": audio_out, "audio_sample_rate": audio_sample_rate})
 
 

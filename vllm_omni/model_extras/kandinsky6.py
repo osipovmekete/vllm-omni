@@ -17,6 +17,11 @@ KANDINSKY6_EXTRA_BODY_PARAMS = frozenset(
         "sample_audio",
         # "pretrain" (text-only) | "tail_cond_first_frame" (reference image).
         "visual_cond_scheme",
+        "target_resolution",
+        "sr_model",
+        "sr_num_inference_steps",
+        "sr_min_overlap",
+        "sr_tiles_batch_size",
     }
 )
 KANDINSKY6_EXTRA_OUTPUT_PARAMS: frozenset[str] = frozenset()
@@ -40,7 +45,7 @@ class Kandinsky6VideoGenerationDefaults:
     duration_seconds: None = None
     default_negative_prompt: None = None
     fps: float = 24.0
-    dimension_multiple: int = 16
+    dimension_multiple: int = 2
     output: str = "kandinsky6_output.mp4"
 
     @property
@@ -70,3 +75,9 @@ def get_kandinsky6_video_generation_defaults(
     """
     del extra_body
     return Kandinsky6VideoGenerationDefaults()
+
+
+def preserve_kandinsky6_reference_image_size(*, model: str | None, revision: str | None = None) -> bool:
+    """The pipeline resizes the reference image to the base generation canvas."""
+    del model, revision
+    return True
