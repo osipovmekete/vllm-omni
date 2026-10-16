@@ -181,6 +181,11 @@ class KandinskyPiFlowScheduler(KandinskyFlowMatchScheduler):
                 "Pi-Flow prediction must have the checkpoint grid packed in its last dimension: "
                 f"expected {(*sample.shape[:-1], expected)}, got {tuple(prediction.shape)}"
             )
+        # Match Diffusers PiFlow: accumulate policy updates in FP32 even when
+        # the transformer predicts BF16, then restore the caller's sample dtype.
+        sample_dtype = sample.dtype
+        sample = sample.float()
+        prediction = prediction.float()
         # [tokens, ..., grid * channels] -> [tokens, grid, ..., channels]
         grid = prediction.reshape(*sample.shape[:-1], self.n_grid, channels).movedim(-2, 1)
         raw_src = self.raw_t_src[step_index]
@@ -215,7 +220,7 @@ class KandinskyPiFlowScheduler(KandinskyFlowMatchScheduler):
             sigma_next = self._shift(raw_next, self.scheduler_scale)
             x_t = x_t + velocity * (sigma_next - sigma_t)
             raw_t, sigma_t = raw_next, sigma_next
-        return x_t
+        return x_t.to(sample_dtype)
 
     def step_pair(
         self,

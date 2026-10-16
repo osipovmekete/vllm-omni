@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from types import SimpleNamespace
-
 import numpy as np
 import pytest
 import torch
@@ -19,6 +17,7 @@ from vllm_omni.diffusion.models.kandinsky6_sr.pipeline_kandinsky6_sr import (
     normalize_frames,
     prepare_pixels,
 )
+from vllm_omni.diffusion.models.kandinsky6_sr.pipeline_output import Kandinsky6SRPipelineOutput
 from vllm_omni.diffusion.models.kandinsky6_sr.scheduling_piflow import PiflowScheduler
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -210,7 +209,7 @@ def test_internal_refiner_crops_padding():
         calls.append(kwargs)
         _, frames, channels, height, width = kwargs["video"].shape
         assert channels == 3
-        return SimpleNamespace(frames=np.full((1, frames, height * 2, width * 2, 3), 0.5, dtype=np.float32))
+        return Kandinsky6SRPipelineOutput(frames=np.full((1, frames, height * 2, width * 2, 3), 0.5, dtype=np.float32))
 
     refiner._inference = inference
     frames = torch.zeros((1, 4, 18, 32, 3), dtype=torch.uint8)

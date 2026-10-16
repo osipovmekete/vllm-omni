@@ -1,18 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from types import SimpleNamespace
+from unittest.mock import create_autospec
 
 import numpy as np
 import pytest
 import torch
 
+from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
+from vllm_omni.diffusion.models.kandinsky6.pipeline_kandinsky6 import LatentBundle
 from vllm_omni.diffusion.models.kandinsky6.super_resolution import (
     DEFAULT_SR_MODEL,
+    Kandinsky6SuperResolution,
     resolve_super_resolution,
     stage_generation_modules_on_cpu,
     validate_super_resolution_execution,
 )
+from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -71,8 +75,9 @@ def test_conflicting_dimensions_and_latent_output():
 
 @pytest.mark.parametrize("world_size,hsdp,layerwise", [(2, False, False), (1, True, False), (1, False, True)])
 def test_unsupported_execution_is_rejected_before_generation(world_size, hsdp, layerwise):
-    config = SimpleNamespace(
-        parallel_config=SimpleNamespace(world_size=world_size, use_hsdp=hsdp), enable_layerwise_offload=layerwise
+    config = OmniDiffusionConfig(
+        parallel_config=DiffusionParallelConfig(tensor_parallel_size=world_size, use_hsdp=hsdp, hsdp_shard_size=1),
+        enable_layerwise_offload=layerwise,
     )
     with pytest.raises(ValueError, match="one GPU"):
         validate_super_resolution_execution(config)
@@ -124,18 +129,20 @@ def test_step_decode_refines_video_and_keeps_generated_audio(monkeypatch, mode):
         calls.append((video.shape, settings))
         return refined
 
-    pipeline._super_resolution = SimpleNamespace(refine=refine)
+    pipeline._super_resolution = create_autospec(Kandinsky6SuperResolution, instance=True)
+    pipeline._super_resolution.refine.side_effect = refine
     monkeypatch.setattr(
         module, "postprocess_video", lambda *a, **kw: torch.zeros((1, 3, 5, 480, 864), dtype=torch.uint8)
     )
     monkeypatch.setattr(module, "postprocess_audio", lambda *a, **kw: audio)
-    state = SimpleNamespace(
+    state = StepRequestState(
+        request_id="sr-test",
         latents=torch.zeros(2, 1, 1, 2),
         sampling=OmniDiffusionSamplingParams(extra_args={"target_resolution": "hd"}),
         extra={
             "audio": None,
             "latent_frames": 2,
-            "bundle": SimpleNamespace(audio_cu_seqlens=None),
+            "bundle": LatentBundle(video=None, audio=None, video_cu_seqlens=None, audio_cu_seqlens=None),
             "sample_audio": True,
             "audio_normalization": "normalize",
             "visual_cond_scheme": mode,

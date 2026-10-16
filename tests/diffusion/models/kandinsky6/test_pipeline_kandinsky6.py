@@ -3,6 +3,7 @@
 
 import numpy as np
 import pytest
+import torch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -325,3 +326,27 @@ def test_hub_component_keys_map_onto_pipeline_modules():
     )
     assert _adapt_k6_weight_name("audio_vae.vocoder.conv_pre.weight") == "audio_vae.native.tod.vocoder.conv_pre.weight"
     assert _adapt_k6_weight_name("audio_vae.mel_converter.hann_window") == "audio_vae.native.mel_converter.hann_window"
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("shift", [1.0, 5.0])
+def test_piflow_rollout_matches_diffusers_reference(dtype, shift):
+    from vllm_omni.diffusion.models.kandinsky6 import KandinskyPiFlowScheduler
+    from vllm_omni.diffusion.models.kandinsky6_sr.scheduling_piflow import PiflowScheduler
+
+    generator = torch.Generator().manual_seed(42)
+    sample = torch.randn(2, 3, 4, generator=generator).to(dtype)
+    scheduler = KandinskyPiFlowScheduler(scheduler_scale=shift)
+    reference = PiflowScheduler(shift=shift)
+    scheduler.set_timesteps(10)
+    reference.set_timesteps(10)
+    for index, timestep in enumerate(reference.timesteps):
+        prediction = torch.randn(2, 3, 40, generator=generator).to(dtype)
+        expected = reference.step(prediction, timestep, sample).prev_sample
+        actual = scheduler._rollout(prediction, sample, index)
+        assert actual.dtype == dtype
+        # Equivalent FP32 interpolation expressions differ by rounding; BF16
+        # results should agree exactly after the final cast.
+        tolerance = 2e-6 if dtype == torch.float32 else 0
+        torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+        sample = expected
