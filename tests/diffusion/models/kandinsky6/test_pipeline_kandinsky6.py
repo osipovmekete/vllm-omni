@@ -261,17 +261,47 @@ def test_postprocess_audio_normalizes_by_default_and_clips_on_request():
         postprocess_audio(bundle, vae, normalization_mode="loud")
 
 
-def test_kandinsky6_pre_process_func_is_identity_for_now():
-    """v1 scope: the pre-process hook is registered (matching the framework's
-    convention for image-conditioned models like SanaImageToVideoPipeline)
-    but does not yet validate/transform the request — documented follow-up,
-    not a silent gap."""
+@pytest.mark.parametrize(
+    "scheduler_config,expected_default",
+    [
+        ({"_class_name": "FlowMatchEulerDiscreteScheduler"}, 50),
+        ({"_class_name": "PiflowScheduler"}, 10),
+        ({"_class_name": "PiFlowScheduler", "default_num_inference_steps": 7}, 7),
+    ],
+)
+@pytest.mark.parametrize("schedule", ["default", "explicit", "timesteps", "sigmas"])
+def test_checkpoint_steps_resolve_before_step_scheduler_admission(
+    tmp_path, scheduler_config, expected_default, schedule
+):
+    import json
+
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.diffusion.models.kandinsky6 import get_kandinsky6_pre_process_func
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-    pre_process = get_kandinsky6_pre_process_func(od_config=None)
-    sentinel = object()
-
-    assert pre_process(sentinel) is sentinel
+    scheduler_dir = tmp_path / "scheduler"
+    scheduler_dir.mkdir()
+    (scheduler_dir / "scheduler_config.json").write_text(json.dumps(scheduler_config))
+    sampling = OmniDiffusionSamplingParams(num_inference_steps=None)
+    expected_steps = expected_default
+    if schedule == "explicit":
+        sampling.num_inference_steps = expected_steps = 3
+    elif schedule == "timesteps":
+        sampling.timesteps = [1000.0, 500.0]
+        expected_steps = 2
+    elif schedule == "sigmas":
+        sampling.sigmas = [1.0, 0.5, 0.1]
+        expected_steps = 3
+    request = OmniDiffusionRequest(prompt={"prompt": "A fox in snow"}, sampling_params=sampling, request_id="k6")
+    pre_process = get_kandinsky6_pre_process_func(OmniDiffusionConfig(model=str(tmp_path), step_execution=True))
+    scheduler = StepScheduler()
+    assert pre_process(request) is request
+    assert scheduler.add_request(request) == "k6"
+    assert scheduler._request_progress["k6"].total_steps == expected_steps
+    if schedule in ("timesteps", "sigmas"):
+        assert sampling.num_inference_steps is None
 
 
 def test_hub_component_keys_map_onto_pipeline_modules():

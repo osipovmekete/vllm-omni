@@ -44,6 +44,7 @@ from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.offloader.config import offload_enabled
 from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from .kandinsky6_transformer import Kandinsky6Transformer3DModel
@@ -945,10 +946,23 @@ def get_kandinsky6_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
-def get_kandinsky6_pre_process_func(od_config: OmniDiffusionConfig):
-    """Factory for the request pre-process hook (image-conditioning input)."""
+def _checkpoint_scheduler_type(scheduler_config: dict[str, Any]) -> type[KandinskyFlowMatchScheduler]:
+    name = str(scheduler_config.get("_class_name", "")).lower().replace("_", "")
+    return KandinskyPiFlowScheduler if "piflow" in name else KandinskyFlowMatchScheduler
 
-    def pre_process_func(request):
+
+def get_kandinsky6_pre_process_func(od_config: OmniDiffusionConfig):
+    """Materialize checkpoint step defaults before StepScheduler admission."""
+    model_root = _resolve_bundle_root(od_config.model)
+    config_path = os.path.join(model_root, "scheduler", "scheduler_config.json")
+    scheduler_config = _load_json(model_root, "scheduler/scheduler_config.json") if os.path.isfile(config_path) else {}
+    scheduler_type = _checkpoint_scheduler_type(scheduler_config)
+    default_steps = int(scheduler_config.get("default_num_inference_steps", scheduler_type.default_num_inference_steps))
+
+    def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
+        sampling = request.sampling_params
+        if sampling.num_inference_steps is None and sampling.timesteps is None and sampling.sigmas is None:
+            sampling.num_inference_steps = default_steps
         return request
 
     return pre_process_func
@@ -1184,15 +1198,12 @@ class Kandinsky6TI2VAPipeline(
                 _load_json(model_root, "scheduler/scheduler_config.json").get("shift", checkpoint_scheduler_scale)
             )
         scheduler_scale = float(model_config.get("scheduler_scale", checkpoint_scheduler_scale))
-        scheduler_type = KandinskyFlowMatchScheduler
         scheduler_kwargs = {}
         scheduler_config = {}
         if os.path.isfile(scheduler_config_path):
             scheduler_config = _load_json(model_root, "scheduler/scheduler_config.json")
-        scheduler_name = str(scheduler_config.get("_class_name", "")).lower().replace("_", "")
-        is_piflow = "piflow" in scheduler_name
-        if is_piflow:
-            scheduler_type = KandinskyPiFlowScheduler
+        scheduler_type = _checkpoint_scheduler_type(scheduler_config)
+        if scheduler_type is KandinskyPiFlowScheduler:
             scheduler_kwargs = {
                 "n_grid": scheduler_config.get("n_grid", scheduler_config.get("dx_num_grid_points", 10)),
                 "num_policy_substeps": scheduler_config.get("num_policy_substeps", 128),
